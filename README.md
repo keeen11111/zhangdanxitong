@@ -2,14 +2,25 @@
 
 外服账单系统 2.0 是一个面向财务人员的薪资数据处理 Web 系统。当前基础框架由 FastAPI 后端、Next.js 前端和 `core/` Excel 处理引擎组成。
 
-## 当前可用框架
+## 当前状态
 
-- 登录与租户身份
-- 项目创建和月份管理
-- Excel 上传与文件列表
-- 六阶段薪资处理工作台
-- 后端服务连接状态
-- 模板导出入口
+项目目前是可测试、可构建的内部薪资 Excel 整合 Web MVP。2026-08-24 已通过 191 项 Python 测试、前端 lint 和生产构建；生产化存储与部署仍在后续计划中。
+
+- 登录与租户身份、项目创建和月份管理
+- Excel 上传、文件列表和六阶段薪资处理工作台
+- Blocker / Warning 校验、公式和格式安全的模板导出
+- 独立人工处理清单的导出与回传更新
+
+完整状态见 [docs/current-status.md](docs/current-status.md)。
+
+## 文档导航
+
+- [项目当前状态与优先级](docs/current-status.md)
+- [统一任务台账](tasks/todo.md)
+- [技术栈与架构](docs/technology-stack.md)
+- [月度薪资处理流程图](docs/payroll-processing-flow.md)
+- [业务术语与字段定义](CONTEXT.md)
+- [架构决策记录](docs/adr/)
 
 ## 本地启动
 
