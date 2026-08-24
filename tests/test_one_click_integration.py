@@ -494,6 +494,43 @@ def test_manual_issues_export_is_created_for_legacy_metadata(tmp_path, monkeypat
     assert workbook["待人工处理"]["B2"].value == "李楠"
 
 
+def test_manual_issues_export_excludes_confirmed_items_when_rebuilt(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(pipeline_module, "EXPORT_DIR", str(tmp_path / "exports"))
+    monkeypatch.setattr(pipeline_module, "SESSION_DIR", str(tmp_path / "sessions"))
+    (tmp_path / "sessions").mkdir()
+    meta = {
+        "filename": "工资核算_2026.06.xlsx",
+        "issues_filename": "待人工处理.xlsx",
+        "issues_path": "project/待人工处理.xlsx",
+        "issues": [
+            {
+                "issue_id": "pending-1",
+                "person_name": "待处理人员",
+                "issue_type": "missing_value",
+                "target_field": "月基本薪资",
+                "message": "缺失",
+                "status": "pending",
+            },
+            {
+                "issue_id": "confirmed-1",
+                "person_name": "已处理人员",
+                "issue_type": "department_transfer",
+                "target_field": "部门",
+                "message": "已确认",
+                "status": "confirmed",
+            },
+        ],
+    }
+
+    _, path = _ensure_manual_issues_export("project", meta)
+
+    workbook = openpyxl.load_workbook(path, data_only=False)
+    sheet = workbook["待人工处理"]
+    assert sheet.max_row == 2
+    assert sheet["B2"].value == "待处理人员"
+    workbook.close()
+
+
 def test_one_click_confirmation_only_changes_pending_items() -> None:
     diff = {
         "hire": [

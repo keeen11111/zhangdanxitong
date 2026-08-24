@@ -1131,7 +1131,7 @@ def _load_current_export_meta(project_id: str, db: Session) -> dict[str, Any]:
 
 
 def _ensure_manual_issues_export(project_id: str, meta: dict[str, Any]) -> tuple[str, str]:
-    """Return the current standalone issues workbook, creating it for legacy exports."""
+    """Return a fresh standalone workbook containing only still-pending issues."""
     filename = meta.get("issues_filename")
     relative_path = meta.get("issues_path")
     if not filename or not relative_path:
@@ -1141,9 +1141,13 @@ def _ensure_manual_issues_export(project_id: str, meta: dict[str, Any]) -> tuple
         meta["issues_filename"] = filename
         meta["issues_path"] = relative_path
     absolute_path = os.path.join(EXPORT_DIR, relative_path)
-    if not os.path.exists(absolute_path):
-        os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
-        write_manual_issues_workbook(absolute_path, meta.get("issues", []))
+    pending_issues = [
+        issue for issue in meta.get("issues", [])
+        if issue.get("status") != "confirmed"
+    ]
+    os.makedirs(os.path.dirname(absolute_path), exist_ok=True)
+    write_manual_issues_workbook(absolute_path, pending_issues)
+    meta["issue_count"] = len(pending_issues)
     with open(_session_path(project_id, "export_meta"), "w", encoding="utf-8") as fp:
         json.dump(meta, fp, ensure_ascii=False)
     return filename, absolute_path
