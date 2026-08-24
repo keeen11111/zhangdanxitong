@@ -997,7 +997,7 @@ def test_candidate_value_manual_issue_includes_candidates_in_copyable_patch() ->
     assert issue["copy_text"] == "E001\t甲\t绩效奖金\t100；200；300"
 
 
-def test_review_workbook_marks_only_changes_in_the_updated_master(tmp_path: Path) -> None:
+def test_review_workbook_annotates_changes_without_using_color_markers(tmp_path: Path) -> None:
     base_path = tmp_path / "总表.xlsx"
     final_path = tmp_path / "正式稿.xlsx"
     review_path = tmp_path / "修改稿.xlsx"
@@ -1027,10 +1027,23 @@ def test_review_workbook_marks_only_changes_in_the_updated_master(tmp_path: Path
     )
 
     review = load_workbook(review_path, data_only=False)
-    assert review.sheetnames == ["工资核算"]
-    assert review["工资核算"]["C2"].fill.fgColor.rgb == "FFFFC000"
-    assert review["工资核算"]["A3"].fill.fgColor.rgb == "FFC6EFCE"
-    assert review["工资核算"]["C2"].value == 9000
-    assert review["工资核算"]["A3"].value == "E002"
-    assert summary == {"change_count": 2, "audit_row_count": 0}
+    payroll = review["工资核算"]
+    audit = review["修改记录"]
+    assert payroll["C2"].fill.patternType is None
+    assert payroll["C2"].comment is not None
+    assert "原值：8000" in payroll["C2"].comment.text
+    assert "新值：9000" in payroll["C2"].comment.text
+    assert payroll["A3"].comment is not None
+    assert "本行新增" in payroll["A3"].comment.text
+    assert audit.max_row == 3
+    assert [cell.value for cell in audit[1]] == [
+        "序号", "工作表", "人员标识", "姓名", "变更类型", "字段", "原值", "新值", "单元格位置",
+    ]
+    assert [cell.value for cell in audit[2]] == [
+        1, "工资核算", "E001", "甲", "字段修改", "月基本薪资", 8000, 9000, "C2",
+    ]
+    assert [cell.value for cell in audit[3]] == [
+        2, "工资核算", "E002", "乙", "新增行", "整行", None, None, "A3",
+    ]
+    assert summary == {"change_count": 2, "audit_row_count": 2}
     review.close()

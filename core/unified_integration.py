@@ -11,6 +11,7 @@ import shutil
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.formula import ArrayFormula
 
@@ -961,8 +962,8 @@ def _normalize_manual_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any
     return normalized
 
 
-_REVIEW_MODIFIED_FILL = PatternFill("solid", fgColor="FFFFC000")
-_REVIEW_NEW_FILL = PatternFill("solid", fgColor="FFC6EFCE")
+_REVIEW_AUDIT_SHEET = "修改记录"
+_REVIEW_COMMENT_AUTHOR = "工资核算系统"
 
 
 def _review_scalar(value: Any) -> Any:
@@ -1025,35 +1026,78 @@ def _review_row_map(
     return rows
 
 
+def _append_review_comment(cell: Any, message: str) -> None:
+    """Preserve any existing note while adding a visible, non-color change marker."""
+    existing = cell.comment.text.strip() if cell.comment else ""
+    content = f"{existing}\n\n{message}".strip() if existing else message
+    cell.comment = Comment(content, _REVIEW_COMMENT_AUTHOR)
+
+
+def _review_audit_sheet(workbook: Any, audit_rows: list[list[Any]]) -> None:
+    if _REVIEW_AUDIT_SHEET in workbook.sheetnames:
+        workbook.remove(workbook[_REVIEW_AUDIT_SHEET])
+    sheet = workbook.create_sheet(_REVIEW_AUDIT_SHEET)
+    headers = [
+        "序号", "工作表", "人员标识", "姓名", "变更类型", "字段", "原值", "新值", "单元格位置",
+    ]
+    sheet.append(headers)
+    for index, row in enumerate(audit_rows, start=1):
+        sheet.append([index, *row])
+
+    widths = {"A": 8, "B": 20, "C": 18, "D": 14, "E": 12, "F": 22, "G": 24, "H": 24, "I": 16}
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:I{max(1, sheet.max_row)}"
+    sheet.sheet_view.showGridLines = False
+
+
 def create_review_workbook(
     base_path: str,
     final_path: str,
     review_path: str,
     issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, int]:
-    """Create a color-marked copy of the final workbook without changing its values."""
+    """Create a review copy with comments and a change ledger, without changing values."""
     shutil.copy2(final_path, review_path)
     base = load_workbook(base_path, data_only=False)
     review = load_workbook(review_path, data_only=False)
-    event_count = 0
+    audit_rows: list[list[Any]] = []
     try:
         for review_sheet in review.worksheets:
+            if review_sheet.title == _REVIEW_AUDIT_SHEET:
+                continue
             base_sheet = base[review_sheet.title] if review_sheet.title in base.sheetnames else None
-            header_row, id_column, name_column, _ = _review_headers(review_sheet)
+            header_row, id_column, name_column, headers = _review_headers(review_sheet)
             base_header_row, base_id_column, base_name_column, _ = _review_headers(base_sheet) if base_sheet else (None, None, None, {})
             final_rows = _review_row_map(review_sheet, header_row, id_column, name_column)
             base_rows = _review_row_map(base_sheet, base_header_row, base_id_column, base_name_column) if base_sheet else {}
             for key, final_row in final_rows.items():
+                employee_id = _review_text(review_sheet.cell(final_row, id_column).value) if id_column else ""
+                person_name = _review_text(review_sheet.cell(final_row, name_column).value) if name_column else ""
                 if key not in base_rows:
-                    event_count += 1
-                    for column in range(1, review_sheet.max_column + 1):
-                        cell = review_sheet.cell(final_row, column)
-                        if cell.value in (None, ""):
-                            continue
-                        cell.fill = _REVIEW_NEW_FILL
+                    marker_column = id_column or name_column
+                    if marker_column is None:
+                        marker_column = next(
+                            (column for column in range(1, review_sheet.max_column + 1)
+                             if review_sheet.cell(final_row, column).value not in (None, "")),
+                            1,
+                        )
+                    marker_cell = review_sheet.cell(final_row, marker_column)
+                    _append_review_comment(marker_cell, "本行新增：该人员/记录为本次更新新增。")
+                    audit_rows.append([
+                        review_sheet.title, employee_id or key, person_name, "新增行", "整行", "", "", marker_cell.coordinate,
+                    ])
                     continue
                 base_row = base_rows[key]
-                changed_columns: list[int] = []
                 for column in range(1, review_sheet.max_column + 1):
                     final_cell = review_sheet.cell(final_row, column)
                     base_cell = base_sheet.cell(base_row, column) if base_sheet else None
@@ -1062,15 +1106,22 @@ def create_review_workbook(
                     if final_value != base_value:
                         if base_cell and _review_external_formula(base_cell.value) and not _review_external_formula(final_cell.value):
                             continue
-                        changed_columns.append(column)
-                        final_cell.fill = _REVIEW_MODIFIED_FILL
-                if changed_columns:
-                    event_count += 1
+                        field = headers.get(column) or f"第{column}列"
+                        _append_review_comment(
+                            final_cell,
+                            f"本次更新\n字段：{field}\n原值：{_review_text(base_value)}\n新值：{_review_text(final_value)}",
+                        )
+                        audit_rows.append([
+                            review_sheet.title, employee_id or key, person_name, "字段修改", field,
+                            base_value if base_value is not None else "", final_value if final_value is not None else "",
+                            final_cell.coordinate,
+                        ])
+        _review_audit_sheet(review, audit_rows)
         review.save(review_path)
     finally:
         base.close()
         review.close()
-    return {"change_count": event_count, "audit_row_count": 0}
+    return {"change_count": len(audit_rows), "audit_row_count": len(audit_rows)}
 
 
 def _populate_manual_issues_sheet(sheet: Any, issues: list[dict[str, Any]]) -> None:
