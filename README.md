@@ -19,6 +19,7 @@
 - [统一任务台账](tasks/todo.md)
 - [技术栈与架构](docs/technology-stack.md)
 - [月度薪资处理流程图](docs/payroll-processing-flow.md)
+- [通用财务工作簿平台规格草案](docs/universal-financial-workbook-spec.md)
 - [业务术语与字段定义](CONTEXT.md)
 - [架构决策记录](docs/adr/)
 

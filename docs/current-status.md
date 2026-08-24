@@ -4,7 +4,7 @@
 
 ## 一句话状态
 
-AutoPayroll-Pro 已是可构建、可测试的内部薪资 Excel 整合 Web MVP：核心月度处理闭环和人工处理回导已具备；面向生产的存储、部署和运维能力尚未完成。
+AutoPayroll-Pro 已是可构建、可测试的内部薪资 Excel 整合 Web MVP：核心月度处理闭环和人工处理回导已具备；产品目标现已确认升级为面向多公司、多模板的通用财务工作簿整合平台。
 
 ## 本次验证结果
 
@@ -38,6 +38,7 @@ AutoPayroll-Pro 已是可构建、可测试的内部薪资 Excel 整合 Web MVP�
 | 安全、审计与可观测性 | 部分完成 | 已有 CORS、上传校验和健康检查；未形成完整审计表、结构化日志和正式安全验收。 |
 | 前端产品化 | 部分完成 | 已有可构建的 Next.js 前端；历史计划所写的 Ant Design 重写与当前 Radix/Tailwind 实现不一致，需单独决策。 |
 | 部署与运维 | 未开始 | 尚无 Alembic、Dockerfile、docker-compose、Nginx 或 CI/CD 工作流。 |
+| 通用财务产品内核 | 规格待确认 | 不再以工资表为唯一领域；先建设通用画像、映射、审核和无损交付能力。 |
 
 ## 主要事实与限制
 
@@ -49,10 +50,11 @@ AutoPayroll-Pro 已是可构建、可测试的内部薪资 Excel 整合 Web MVP�
 
 ## 当前优先级
 
-1. 完成“通用语义 Sheet 归并”三项验收，并将相关规格和测试正式提交。
-2. 确认前端技术路线：接受当前 Radix/Tailwind，或另立任务迁移到 Ant Design；两者不能同时作为标准。
-3. 以特征化测试为前提，将旧路由收敛至 `pipeline`，再迁移 PipelineSession 和审计数据。
-4. 引入 PostgreSQL、Alembic、Docker Compose 和最低限度的 CI，形成可在内网部署的交付包。
+1. 确认 [通用财务工作簿整合平台规格](universal-financial-workbook-spec.md) 的首期边界，并将其转化为实施计划。
+2. 将通用工作簿画像、映射、审核与导出内核置于工资等领域适配器之前；完成语义 Sheet 归并验收。
+3. 确认前端技术路线：接受当前 Radix/Tailwind，或另立任务迁移到 Ant Design；两者不能同时作为标准。
+4. 以特征化测试为前提，将旧路由收敛至 `pipeline`，再迁移 PipelineSession 和审计数据。
+5. 引入 PostgreSQL、Alembic、Docker Compose 和最低限度的 CI，形成可在内网部署的交付包。
 
 ## 相关文档
 
@@ -60,3 +62,4 @@ AutoPayroll-Pro 已是可构建、可测试的内部薪资 Excel 整合 Web MVP�
 - [月度处理流程](payroll-processing-flow.md)
 - [任务总台账](../tasks/todo.md)
 - [语义 Sheet 归并规格](semantic-sheet-integration-spec.md)
+- [通用财务工作簿平台规格草案](universal-financial-workbook-spec.md)
