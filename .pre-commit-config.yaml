@@ -1,0 +1,33 @@
+# pre-commit 钩子配置
+# 安装: pip install pre-commit && pre-commit install
+# 手动跑: pre-commit run --all-files
+
+repos:
+  # 通用检查
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: check-case-conflict
+
+  # Python 代码检查
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff
+        args: ['--fix']
+      - id: ruff-format
+
+  # Python 安全扫描
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.9
+    hooks:
+      - id: bandit
+        args: ['-c', 'pyproject.toml', '-r', 'backend/', 'core/']
+        additional_dependencies: ['tomli']

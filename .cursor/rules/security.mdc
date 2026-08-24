@@ -1,0 +1,39 @@
+---
+description: 安全规范——密钥管理、多租户隔离、敏感数据、SQL注入防护。适用于所有后端和core代码。
+globs: ["backend/**/*.py", "core/**/*.py"]
+---
+
+# 安全规范
+
+## 密钥与配置
+- JWT 密钥、DB 连接串、refresh token 密钥必须走环境变量（os.getenv），禁止硬编码
+- `.env` 文件不提交，只提交 `.env.example`
+- 配置分层：`config/dev.py`、`config/prod.py`
+
+## 多租户隔离（最高优先级）
+- 所有业务查询必须带 `tenant_id` 过滤，无例外
+- 文件上传路径按 `{UPLOAD_DIR}/{tenant_id}/{project_id}/` 隔离
+- JWT payload 含 `tenant_id`，路由层通过依赖注入获取
+- 禁止用用户传入的 tenant_id，必须从 JWT 取
+
+## 敏感数据（薪资系统特有）
+- 身份证号、银行卡号、工资金额是敏感数据
+- 日志禁止打印这些字段的值，只打印工号
+- API 响应中银行卡号脱敏（只显示后4位）
+- 数据库存储身份证号需加密（阶段2实现）
+
+## SQL 注入防护
+- SQLAlchemy ORM 用参数化查询
+- DuckDB（core/db_engine.py）禁止 f-string 拼 SQL，用参数化
+- 用户输入进 SQL 前必须校验类型
+
+## 文件上传安全
+- 校验文件类型（仅 .xlsx/.xls）
+- 限制文件大小（≤50MB）
+- 防路径穿越：文件名清洗，禁止 `../`
+- 上传目录不可执行
+
+## 认证
+- 密码用 passlib bcrypt 哈希（已有）
+- JWT 短期（15min）+ refresh token 长期（7天）
+- 登录失败限流（5次/分钟）

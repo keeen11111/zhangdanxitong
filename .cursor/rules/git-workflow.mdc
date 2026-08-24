@@ -1,0 +1,48 @@
+---
+description: Git工作流规范——原子提交、分支策略、提交信息。适用于所有代码变更。
+globs: ["**/*"]
+---
+
+# Git 工作流规范
+
+## 原子提交
+- 每次提交只做一件事，~100 行变更
+- 一个 bug 一个提交，一个功能一个提交
+- 不混合重构和新功能
+- 可 bisect：任何提交都能单独跑测试
+
+## 提交信息
+```
+<type>: <简述>
+
+<详细说明，可选>
+
+<关联任务 T1.2 等，可选>
+```
+
+type 取值：
+- `feat`: 新功能
+- `fix`: 修 bug
+- `refactor`: 重构（不改行为）
+- `test`: 加测试
+- `chore`: 构建/配置/依赖
+- `docs`: 文档
+
+示例：`feat: pipeline 合并 entities 快照能力`
+
+## 分支策略
+- `main`: 可发布，通过 CI
+- `feature/<task-id>-<简述>`: 功能分支
+- `fix/<task-id>-<简述>`: 修复分支
+
+## 提交前检查
+- pytest 通过
+- 无敏感信息（grep 密钥/token）
+- 无大文件（Excel/图片不进 git，用 .gitignore）
+- 无 console.log / print 调试代码
+
+## 禁止
+- 不 force push 到 main
+- 不提交 `.env`、`__pycache__`、`node_modules`、`.next`、`*.xlsx`
+- 不提交 `backend/data/sessions/*.json`（中间态）
+- 不绕过 CI

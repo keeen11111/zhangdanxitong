@@ -1,0 +1,53 @@
+---
+description: API设计规范——统一响应格式、异常处理、输入校验。适用于所有路由代码。
+globs: ["backend/routers/**/*.py", "backend/schemas.py", "backend/main.py"]
+---
+
+# API 设计规范
+
+## 统一响应格式
+所有 API 返回统一结构：
+
+```python
+# 成功
+{"code": 0, "data": <payload>, "message": "ok"}
+
+# 失败
+{"code": <业务错误码>, "data": null, "message": "<错误描述>"}
+```
+
+错误码约定：
+- 0: 成功
+- 1xxx: 认证/授权错误
+- 2xxx: 参数校验错误
+- 3xxx: 业务逻辑错误（如数据不存在）
+- 5xxx: 服务器内部错误
+
+## 统一异常处理
+在 main.py 注册全局异常处理器，不裸抛 HTTPException：
+
+```python
+@app.exception_handler(BusinessError)
+async def business_error_handler(request, exc):
+    return JSONResponse({"code": exc.code, "data": None, "message": exc.message})
+```
+
+业务异常用自定义异常类（继承 Exception），带 code 和 message。
+
+## 输入校验
+- 所有请求用 Pydantic 模型校验，不裸接 dict
+- 路径参数标类型（`project_id: int`）
+- 查询参数有默认值和上限（分页 `limit: int = 50, max=200`）
+
+## 路由组织
+- 每个资源一个路由文件
+- 路由前缀统一 `/api/{resource}`
+- 用依赖注入做认证和租户隔离（`Depends(get_current_user)`）
+
+## 分页
+列表接口必须分页，返回 `{items, total, page, limit}`。
+
+## 命名
+- 路径用复数名词（/api/projects）
+- 动作用 HTTP 方法表达（GET=list, POST=create, PATCH=update, DELETE=delete）
+- 字段名用 snake_case（Python 侧），JSON 输出可用 camelCase（前端约定）

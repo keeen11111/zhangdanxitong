@@ -1,0 +1,11 @@
+# Backend runtime dependencies
+fastapi
+uvicorn[standard]
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+pydantic[email]
+pandas
+openpyxl
+duckdb

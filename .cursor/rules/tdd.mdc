@@ -1,0 +1,51 @@
+---
+description: TDD规范——brownfield项目先写特征化测试再改代码。适用于core/和backend/。
+globs: ["core/**/*.py", "backend/**/*.py", "backend/tests/**/*.py"]
+---
+
+# 测试驱动开发规范
+
+## Brownfield 铁律
+改任何老代码前，先写**特征化测试**（characterization test）固化现有行为。
+
+特征化测试不判断对错，只记录"现在就是这样"。先写测试 → 跑过 → 再改代码 → 测试仍过。
+
+## 测试位置
+```
+backend/tests/
+├── core/           # 镜像 core/ 结构
+│   ├── test_normalizer.py
+│   ├── test_schema_config.py
+│   ├── test_entity_engine.py
+│   ├── test_db_engine.py
+│   ├── test_diff_engine.py
+│   ├── test_validator.py
+│   └── test_excel_engine.py
+├── routers/        # 镜像 routers/ 结构
+│   ├── test_auth.py
+│   ├── test_projects.py
+│   └── test_pipeline.py
+└── conftest.py     # fixtures
+```
+
+## 覆盖率目标
+- core/ ≥ 80%（核心资产，必须高覆盖）
+- backend/routers/ ≥ 60%（API 集成测试）
+- 每次提交不得降低总覆盖率
+
+## 测试命名
+```python
+def test_<被测函数>_<场景>_<预期>():
+    # 如: test_normalize_amount_strips_yuan_symbol()
+    ...
+```
+
+## Fixture 复用
+- conftest.py 定义共享 fixture（db session、test client、样例数据）
+- 样例 Excel 放 `backend/tests/fixtures/`
+
+## 不做的事
+- 不为 getter/setter 写测试（无逻辑）
+- 不 mock 被测对象本身
+- 不删失败的测试（除非经批准）
+- 不写依赖外部网络的测试（用本地 fixture）
