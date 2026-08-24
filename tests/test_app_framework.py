@@ -34,6 +34,8 @@ def test_app_registers_core_routes() -> None:
     assert "/api/projects/{project_id}/files/batch-auto" in paths
     assert "/api/projects/{project_id}/files/{file_id}/analysis" in paths
     assert "/api/pipeline/{project_id}/integrate" in paths
+    assert "/api/pipeline/{project_id}/experience-suggestions" in paths
+    assert "/api/pipeline/{project_id}/experiences" in paths
 
 
 def test_sqlite_engine_disables_thread_check() -> None:

@@ -83,3 +83,22 @@ def test_ignores_identity_fields_when_recording_conditions(tmp_path: Path) -> No
     )
 
     assert rule["conditions"] == {"变动项": "月基本薪资"}
+
+
+def test_ignores_identity_field_aliases_when_recording_conditions(tmp_path: Path) -> None:
+    store = ExperienceStore(tmp_path)
+    item = {"员工工号": "E001", "人员姓名": "张三", "变动项": "月基本薪资"}
+
+    rule = store.record(
+        tenant_id="tenant-a",
+        project_id="project-1",
+        created_by="user-1",
+        diff_type="salary_change",
+        item=item,
+        match_fields=["员工工号", "人员姓名", "变动项"],
+        decision="confirmed",
+        updates={},
+        note="按调薪规则处理。",
+    )
+
+    assert rule["conditions"] == {"变动项": "月基本薪资"}

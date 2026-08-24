@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import settings
 from backend.database import init_db
-from backend.routers import auth, projects, payroll, modules, entities, pipeline
+from backend.routers import auth, projects, payroll, modules, entities, experiences, pipeline
 
 
 settings.validate()
@@ -45,6 +45,7 @@ app.include_router(payroll.router)
 app.include_router(modules.router)
 app.include_router(entities.router)
 app.include_router(pipeline.router)
+app.include_router(experiences.router)
 
 
 @app.get("/", tags=["health"])

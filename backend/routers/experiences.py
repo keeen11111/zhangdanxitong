@@ -1,0 +1,168 @@
+"""Endpoints for human-confirmed, tenant-scoped review experience rules."""
+from __future__ import annotations
+
+import os
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from backend.auth import get_current_user
+from backend.database import DATA_DIR, get_db
+from backend.experience_store import ExperienceStore
+from backend.models import User
+from backend.routers.pipeline import _load_json, _load_project_or_404, _save_json
+
+
+router = APIRouter(prefix="/api/pipeline", tags=["experiences"])
+experience_store = ExperienceStore(os.path.join(DATA_DIR, "experience_rules"))
+
+
+class ExperienceSuggestion(BaseModel):
+    rule_id: str
+    decision: Literal["confirmed", "ignored"]
+    updates: dict[str, Any]
+    note: str
+    matched_fields: list[str]
+
+
+class ExperienceSuggestionItem(BaseModel):
+    diff_type: str
+    item_index: int
+    suggestions: list[ExperienceSuggestion]
+
+
+class ExperienceSuggestionResponse(BaseModel):
+    items: list[ExperienceSuggestionItem]
+    total: int
+
+
+class ExperienceRecordIn(BaseModel):
+    diff_type: str = Field(min_length=1, max_length=64)
+    item_index: int = Field(ge=0)
+    match_fields: list[str] = Field(min_length=1, max_length=5)
+    decision: Literal["confirmed", "ignored"]
+    note: str = Field(min_length=1, max_length=1000)
+
+
+class ExperienceRuleOut(BaseModel):
+    id: str
+    diff_type: str
+    conditions: dict[str, Any]
+    decision: Literal["confirmed", "ignored"]
+    note: str
+    created_at: str
+
+
+class ExperienceRulePage(BaseModel):
+    items: list[ExperienceRuleOut]
+    page: int
+    page_size: int
+    total: int
+
+
+def _reviewable_diff_items(diff: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
+    return [
+        (diff_type, items)
+        for diff_type, items in diff.items()
+        if diff_type != "summary" and isinstance(items, list)
+    ]
+
+
+@router.get("/{project_id}/experience-suggestions", response_model=ExperienceSuggestionResponse)
+def get_experience_suggestions(
+    project_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ExperienceSuggestionResponse:
+    """Return past human decisions that exactly match current pending differences."""
+    project = _load_project_or_404(project_id, user, db)
+    data = _load_json(project.id, "diff")
+    if not data:
+        raise HTTPException(status_code=400, detail="尚未计算差异")
+
+    suggested_items: list[ExperienceSuggestionItem] = []
+    for diff_type, items in _reviewable_diff_items(data.get("diff", {})):
+        for item_index, item in enumerate(items):
+            if item.get("status", "pending") != "pending":
+                continue
+            suggestions = experience_store.suggest(user.tenant_id, diff_type, item)
+            if suggestions:
+                suggested_items.append(ExperienceSuggestionItem(
+                    diff_type=diff_type,
+                    item_index=item_index,
+                    suggestions=suggestions,
+                ))
+    return ExperienceSuggestionResponse(items=suggested_items, total=len(suggested_items))
+
+
+@router.post("/{project_id}/experiences", response_model=ExperienceRuleOut, status_code=201)
+def record_review_experience(
+    project_id: str,
+    payload: ExperienceRecordIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ExperienceRuleOut:
+    """Confirm one decision and save non-PII matching conditions for later review."""
+    project = _load_project_or_404(project_id, user, db)
+    data = _load_json(project.id, "diff")
+    if not data:
+        raise HTTPException(status_code=400, detail="尚未计算差异")
+
+    diff = data.get("diff", {})
+    items = diff.get(payload.diff_type)
+    if not isinstance(items, list) or payload.item_index >= len(items):
+        raise HTTPException(status_code=400, detail="差异类型或索引无效")
+    item = items[payload.item_index]
+    if item.get("status", "pending") != "pending":
+        raise HTTPException(status_code=409, detail="该差异项已审核，不能覆盖历史决定")
+    match_fields = [field.strip() for field in payload.match_fields if field.strip()]
+    if len(match_fields) != len(set(match_fields)):
+        raise HTTPException(status_code=422, detail="匹配字段不能重复")
+    if any(field not in item for field in match_fields):
+        raise HTTPException(status_code=422, detail="匹配字段必须存在于当前差异项")
+
+    try:
+        rule = experience_store.record(
+            tenant_id=user.tenant_id,
+            project_id=project.id,
+            created_by=user.id,
+            diff_type=payload.diff_type,
+            item=item,
+            match_fields=match_fields,
+            decision=payload.decision,
+            updates={},
+            note=payload.note.strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    item["status"] = payload.decision
+    _save_json(project.id, "diff", data)
+    return ExperienceRuleOut(**rule)
+
+
+@router.get("/{project_id}/experiences", response_model=ExperienceRulePage)
+def list_review_experiences(
+    project_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ExperienceRulePage:
+    """List this tenant's reusable review rules without exposing other tenants' data."""
+    _load_project_or_404(project_id, user, db)
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=422, detail="分页参数无效")
+    rules, total = experience_store.list_rules(
+        user.tenant_id,
+        offset=(page - 1) * page_size,
+        limit=page_size,
+    )
+    return ExperienceRulePage(
+        items=[ExperienceRuleOut(**rule) for rule in rules],
+        page=page,
+        page_size=page_size,
+        total=total,
+    )

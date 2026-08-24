@@ -10,6 +10,7 @@
 - Excel 上传、文件列表和六阶段薪资处理工作台
 - Blocker / Warning 校验、公式和格式安全的模板导出
 - 独立人工处理清单的导出与回传更新
+- 人工审核经验库：沉淀确认理由，并为相同差异提供人工可采纳的建议
 
 完整状态见 [docs/current-status.md](docs/current-status.md)。
 
@@ -19,6 +20,7 @@
 - [统一任务台账](tasks/todo.md)
 - [技术栈与架构](docs/technology-stack.md)
 - [月度薪资处理流程图](docs/payroll-processing-flow.md)
+- [人工审核经验库使用说明](docs/review-experience-library.md)
 - [通用财务工作簿平台规格草案](docs/universal-financial-workbook-spec.md)
 - [业务术语与字段定义](CONTEXT.md)
 - [架构决策记录](docs/adr/)

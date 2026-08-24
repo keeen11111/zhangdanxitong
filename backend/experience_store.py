@@ -13,7 +13,19 @@ from typing import Any
 from uuid import uuid4
 
 
-IDENTITY_FIELDS = frozenset({"工号", "姓名", "身份证号", "身份证号码", "证件号码"})
+SENSITIVE_FIELD_TOKENS = (
+    "工号",
+    "姓名",
+    "身份证",
+    "证件",
+    "手机",
+    "电话",
+    "邮箱",
+    "地址",
+    "银行卡",
+    "银行账号",
+    "账户",
+)
 
 
 class ExperienceStore:
@@ -91,7 +103,7 @@ class ExperienceStore:
     def _conditions_from_item(item: dict[str, Any], match_fields: list[str]) -> dict[str, Any]:
         conditions: dict[str, Any] = {}
         for field in match_fields:
-            if field in IDENTITY_FIELDS or field not in item:
+            if _is_sensitive_field(field) or field not in item:
                 continue
             value = item[field]
             if isinstance(value, (dict, list, tuple, set)) or value in (None, ""):
@@ -124,3 +136,7 @@ class ExperienceStore:
         temp_path = path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
         temp_path.replace(path)
+
+
+def _is_sensitive_field(field: str) -> bool:
+    return any(token in field for token in SENSITIVE_FIELD_TOKENS)
