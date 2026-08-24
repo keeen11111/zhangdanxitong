@@ -550,6 +550,14 @@ export const api = {
       `/api/pipeline/${projectId}/manual-review/issue/resolve`,
       { method: "POST", body: JSON.stringify({ issue_id: issueId, action }) },
     ),
+  importManualReviewWorkbook: (projectId: string, file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return request<PipelineExportResult>(
+      `/api/pipeline/${projectId}/manual-review/import`,
+      { method: "POST", body: formData },
+    );
+  },
   pipelineExportDownloadUrl: (projectId: string) =>
     `${API_BASE}/api/pipeline/${projectId}/export/download`,
   manualIssuesExportDownloadUrl: (projectId: string) =>

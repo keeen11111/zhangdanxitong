@@ -131,8 +131,8 @@ def test_manual_issues_are_exported_to_a_standalone_workbook(tmp_path: Path) -> 
     sheet = workbook["待人工处理"]
     assert workbook.sheetnames == ["待人工处理"]
     assert sheet["A1"].value == "序号"
-    assert sheet["B2"].value == "李楠"
-    assert sheet["H2"].value == "待处理"
+    assert sheet["C2"].value == "李楠"
+    assert sheet["I2"].value == "待处理"
     assert sheet.row_dimensions[2].height > 52
 
 
@@ -954,10 +954,17 @@ def test_manual_issues_workbook_sorts_simple_before_complex(tmp_path: Path) -> N
 
     workbook = load_workbook(output_path, data_only=False)
     sheet = workbook["待人工处理"]
-    assert sheet["B2"].value == "简单人员"
-    assert sheet["D2"].value == "简单"
-    assert sheet["B3"].value == "复杂人员"
-    assert sheet["D3"].value == "复杂"
+    assert [cell.value for cell in sheet[1]] == [
+        "序号", "事项编号", "人员姓名", "问题类型", "处理难度", "目标字段", "问题说明",
+        "建议操作", "处理状态", "处理结果", "处理值", "处理备注", "来源文件", "来源工作表",
+        "可选动作", "可复制内容",
+    ]
+    assert sheet["C2"].value == "简单人员"
+    assert sheet["E2"].value == "简单"
+    assert sheet["J2"].value == "待处理"
+    assert len(sheet.data_validations.dataValidation) == 1
+    assert sheet["C3"].value == "复杂人员"
+    assert sheet["E3"].value == "复杂"
     workbook.close()
 
 

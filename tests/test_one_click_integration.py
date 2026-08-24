@@ -17,6 +17,7 @@ from openpyxl.worksheet.formula import ArrayFormula
 import backend.routers.pipeline as pipeline_module
 from backend.routers.pipeline import (
     _build_export_preview,
+    _apply_manual_review_workbook,
     _choose_template_candidate,
     _copy_source_workbooks,
     _copy_novel_source_sheets,
@@ -352,12 +353,44 @@ def test_resolve_manual_issue_applies_recommended_value_or_keeps_current() -> No
     assert _resolve_manual_issue(final_data, "issue-1", "apply_proposed") == "新部门"
     assert final_data["entities"]["employee_profile"][0]["部门"] == "新部门"
     assert final_data["issues"][0]["status"] == "confirmed"
-
     final_data["issues"][0]["status"] = "pending"
     final_data["entities"]["employee_profile"][0]["部门"] = "旧部门"
     assert _resolve_manual_issue(final_data, "issue-1", "keep_current") == "旧部门"
     assert final_data["entities"]["employee_profile"][0]["部门"] == "旧部门"
     assert final_data["issues"][0]["status"] == "confirmed"
+
+
+def test_uploaded_manual_review_workbook_applies_a_unique_pending_update() -> None:
+    final_data = {
+        "entities": {
+            "employee_profile": [{"工号": "E001", "姓名": "甲", "部门": "旧部门"}],
+        },
+        "issues": [{
+            "issue_id": "issue-1",
+            "issue_type": "department_transfer",
+            "employee_id": "E001",
+            "person_name": "甲",
+            "target_field": "部门",
+            "current_value": "旧部门",
+            "status": "pending",
+        }],
+    }
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "待人工处理"
+    sheet.append(["事项编号", "处理结果", "处理值", "处理备注"])
+    sheet.append(["issue-1", "更新到总表", "新部门", "已核对异动单"])
+    content = BytesIO()
+    workbook.save(content)
+    workbook.close()
+
+    applied = _apply_manual_review_workbook(final_data, content.getvalue())
+
+    assert applied == 1
+    assert final_data["entities"]["employee_profile"][0]["部门"] == "新部门"
+    assert final_data["issues"][0]["status"] == "confirmed"
+    assert final_data["issues"][0]["resolution"] == "imported_workbook"
+    assert final_data["issues"][0]["resolution_note"] == "已核对异动单"
 
 
 def test_duty_roster_counts_replace_old_master_values(tmp_path) -> None:
@@ -491,7 +524,8 @@ def test_manual_issues_export_is_created_for_legacy_metadata(tmp_path, monkeypat
 
     workbook = openpyxl.load_workbook(path, data_only=False)
     assert filename.endswith(".xlsx")
-    assert workbook["待人工处理"]["B2"].value == "李楠"
+    assert workbook["待人工处理"]["B2"].value == "issue-0"
+    assert workbook["待人工处理"]["C2"].value == "李楠"
 
 
 def test_manual_issues_export_excludes_confirmed_items_when_rebuilt(tmp_path, monkeypatch) -> None:
@@ -527,7 +561,8 @@ def test_manual_issues_export_excludes_confirmed_items_when_rebuilt(tmp_path, mo
     workbook = openpyxl.load_workbook(path, data_only=False)
     sheet = workbook["待人工处理"]
     assert sheet.max_row == 2
-    assert sheet["B2"].value == "待处理人员"
+    assert sheet["B2"].value == "pending-1"
+    assert sheet["C2"].value == "待处理人员"
     workbook.close()
 
 

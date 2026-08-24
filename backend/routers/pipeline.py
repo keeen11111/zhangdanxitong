@@ -22,7 +22,7 @@ from urllib.parse import quote
 import pandas as pd
 import openpyxl
 from openpyxl.drawing.image import Image as OpenpyxlImage
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile as FastAPIUploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -43,6 +43,8 @@ from core.unified_integration import (
     create_review_workbook,
     discover_people_in_workbook,
     export_unified_workbook,
+    MANUAL_ISSUES_SHEET,
+    MANUAL_REVIEW_OUTCOMES,
     write_manual_issues_workbook,
     remove_manual_issues_sheet,
 )
@@ -926,6 +928,8 @@ def _confirm_department_transfers(
 
 
 _GUIDED_RESOLUTION_FIELDS = {"公司", "部门", "岗位", "工作地点", "本月状态", "离职日期"}
+_MANUAL_REVIEW_FORBIDDEN_FIELDS = {"工号", "姓名", "身份证号", "_person_key"}
+_MANUAL_REVIEW_REQUIRED_HEADERS = {"事项编号", "处理结果", "处理值", "处理备注"}
 
 
 def _resolve_manual_issue(
@@ -966,6 +970,110 @@ def _resolve_manual_issue(
     issue["status"] = "confirmed"
     issue["resolution"] = action
     return str(proposed_value)
+
+
+def _manual_review_headers(sheet: Any) -> dict[str, int]:
+    headers = {
+        str(cell.value).strip(): index
+        for index, cell in enumerate(sheet[1], start=1)
+        if cell.value not in (None, "")
+    }
+    missing = _MANUAL_REVIEW_REQUIRED_HEADERS - set(headers)
+    if missing:
+        raise ValueError(f"人工处理表缺少必要列：{'、'.join(sorted(missing))}")
+    return headers
+
+
+def _manual_review_value(value: Any, issue: dict[str, Any]) -> Any:
+    if value in (None, ""):
+        raise ValueError(f"事项 {issue.get('issue_id')} 选择更新到总表时必须填写处理值")
+    reference = issue.get("proposed_value", issue.get("current_value"))
+    if isinstance(reference, bool):
+        if isinstance(value, str) and value.strip() in {"是", "true", "True", "1"}:
+            return True
+        if isinstance(value, str) and value.strip() in {"否", "false", "False", "0"}:
+            return False
+    if isinstance(reference, int) and not isinstance(reference, bool) and isinstance(value, str):
+        return int(float(value.replace(",", "").strip()))
+    if isinstance(reference, float) and isinstance(value, str):
+        return float(value.replace(",", "").strip())
+    return value.strip() if isinstance(value, str) else value
+
+
+def _manual_review_target_record(final_data: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
+    field = str(issue.get("target_field") or "").strip()
+    employee_id = str(issue.get("employee_id") or "").strip()
+    if not employee_id:
+        raise ValueError(f"事项 {issue.get('issue_id')} 缺少唯一工号，不能回写总表")
+    if not field or field in _MANUAL_REVIEW_FORBIDDEN_FIELDS:
+        raise ValueError(f"事项 {issue.get('issue_id')} 的目标字段不能安全回写")
+
+    matches: list[dict[str, Any]] = []
+    for entity_name, records in final_data.get("entities", {}).items():
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if str(record.get("工号") or "").strip() != employee_id:
+                continue
+            if field in record or (entity_name == "employee_profile" and field in _GUIDED_RESOLUTION_FIELDS):
+                matches.append(record)
+    if len(matches) != 1:
+        raise ValueError(
+            f"事项 {issue.get('issue_id')} 无法唯一定位“{field}”的总表数据，不能自动回写"
+        )
+    return matches[0]
+
+
+def _apply_manual_review_workbook(final_data: dict[str, Any], content: bytes) -> int:
+    """Apply only explicit, safely addressable workbook decisions to the final data set."""
+    try:
+        workbook = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=False)
+    except Exception as exc:
+        raise ValueError("无法读取人工处理表，请上传系统下载后填写的 .xlsx 文件") from exc
+    try:
+        if MANUAL_ISSUES_SHEET not in workbook.sheetnames:
+            raise ValueError("人工处理表中未找到“待人工处理”工作表")
+        sheet = workbook[MANUAL_ISSUES_SHEET]
+        headers = _manual_review_headers(sheet)
+        issue_rows: dict[str, tuple[str, Any, str]] = {}
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            issue_id = str(row[headers["事项编号"] - 1] or "").strip()
+            outcome = str(row[headers["处理结果"] - 1] or "待处理").strip()
+            if not issue_id or outcome == "待处理":
+                continue
+            if outcome not in MANUAL_REVIEW_OUTCOMES:
+                raise ValueError(f"事项 {issue_id} 的处理结果无效")
+            if issue_id in issue_rows:
+                raise ValueError(f"人工处理表中重复填写了事项 {issue_id}")
+            issue_rows[issue_id] = (
+                outcome,
+                row[headers["处理值"] - 1],
+                str(row[headers["处理备注"] - 1] or "").strip(),
+            )
+    finally:
+        workbook.close()
+
+    _assign_manual_issue_ids(final_data.get("issues", []))
+    issues_by_id = {str(issue.get("issue_id")): issue for issue in final_data.get("issues", [])}
+    unknown_ids = set(issue_rows) - set(issues_by_id)
+    if unknown_ids:
+        raise ValueError(f"人工处理表包含当前批次不存在的事项：{'、'.join(sorted(unknown_ids))}")
+
+    applied = 0
+    for issue_id, (outcome, value, note) in issue_rows.items():
+        issue = issues_by_id[issue_id]
+        if issue.get("status") == "confirmed":
+            continue
+        if outcome == "更新到总表":
+            record = _manual_review_target_record(final_data, issue)
+            record[str(issue["target_field"]).strip()] = _manual_review_value(value, issue)
+            issue["resolution"] = "imported_workbook"
+        else:
+            issue["resolution"] = "keep_current"
+        issue["status"] = "confirmed"
+        issue["resolution_note"] = note
+        applied += 1
+    return applied
 
 
 def _record_identity_tokens(record: dict[str, Any]) -> set[tuple[str, str]]:
@@ -1141,6 +1249,7 @@ def _ensure_manual_issues_export(project_id: str, meta: dict[str, Any]) -> tuple
         meta["issues_filename"] = filename
         meta["issues_path"] = relative_path
     absolute_path = os.path.join(EXPORT_DIR, relative_path)
+    _assign_manual_issue_ids(meta.get("issues", []))
     pending_issues = [
         issue for issue in meta.get("issues", [])
         if issue.get("status") != "confirmed"
@@ -1153,7 +1262,7 @@ def _ensure_manual_issues_export(project_id: str, meta: dict[str, Any]) -> tuple
     return filename, absolute_path
 
 
-_REVIEW_EXPORT_FORMAT_VERSION = 2
+_REVIEW_EXPORT_FORMAT_VERSION = 3
 
 
 def _ensure_review_export(
@@ -2130,6 +2239,40 @@ class DepartmentTransferConfirmIn(BaseModel):
 class ManualIssueResolveIn(BaseModel):
     issue_id: str = Field(min_length=1, max_length=120)
     action: str = Field(pattern="^(apply_proposed|keep_current)$")
+
+
+@router.post(
+    "/{project_id}/manual-review/import",
+    response_model=ExportResult,
+)
+def import_manual_review_workbook(
+    project_id: str,
+    file: FastAPIUploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Import explicit manual decisions and regenerate the formal and review workbooks."""
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="请上传系统下载后填写的 .xlsx 人工处理表")
+    content = file.file.read()
+    if not content or len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="人工处理表不能为空且不能超过 10 MB")
+
+    p = _load_project_or_404(project_id, user, db)
+    final_data = _load_json(p.id, "final_db")
+    if not final_data:
+        raise HTTPException(status_code=400, detail="请先完成数据整合")
+    try:
+        updated = _apply_manual_review_workbook(final_data, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=400, detail="人工处理表中没有可更新到总表的已处理事项")
+
+    _save_json(p.id, "final_db", final_data)
+    result = export_pipeline(project_id, user=user, db=db)
+    result.log.insert(0, f"已导入人工处理表并更新 {updated} 项；未处理事项保留在最新清单中")
+    return result
 
 
 @router.post(

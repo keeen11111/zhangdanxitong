@@ -13,6 +13,7 @@ from typing import Any
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.formula import ArrayFormula
 
 
@@ -859,6 +860,7 @@ def _missing_value_issues(entities: dict[str, list[dict]]) -> list[dict[str, Any
 
 
 MANUAL_ISSUES_SHEET = "待人工处理"
+MANUAL_REVIEW_OUTCOMES = ("待处理", "更新到总表", "保留总表")
 
 _ISSUE_DIFFICULTY = {
     "missing_value": "简单",
@@ -1126,18 +1128,21 @@ def create_review_workbook(
 
 def _populate_manual_issues_sheet(sheet: Any, issues: list[dict[str, Any]]) -> None:
     headers = [
-        "序号", "人员姓名", "问题类型", "处理难度", "目标字段", "问题说明",
-        "建议操作", "处理状态", "来源文件", "来源工作表", "可选动作", "可复制内容",
+        "序号", "事项编号", "人员姓名", "问题类型", "处理难度", "目标字段", "问题说明",
+        "建议操作", "处理状态", "处理结果", "处理值", "处理备注", "来源文件", "来源工作表",
+        "可选动作", "可复制内容",
     ]
     widths = {
-        "A": 8, "B": 14, "C": 20, "D": 12, "E": 24, "F": 48,
-        "G": 28, "H": 12, "I": 30, "J": 24, "K": 34, "L": 48,
+        "A": 8, "B": 16, "C": 14, "D": 20, "E": 12, "F": 24, "G": 48,
+        "H": 28, "I": 12, "J": 16, "K": 22, "L": 30, "M": 30, "N": 24,
+        "O": 34, "P": 48,
     }
     normalized_issues = _normalize_manual_issues(issues)
     sheet.append(headers)
     for index, issue in enumerate(normalized_issues, start=1):
         row = [
             index,
+            issue.get("issue_id", ""),
             issue.get("person_name", ""),
             issue.get("problem_type", "其他问题"),
             issue.get("difficulty", "一般"),
@@ -1145,6 +1150,9 @@ def _populate_manual_issues_sheet(sheet: Any, issues: list[dict[str, Any]]) -> N
             issue.get("message", ""),
             issue.get("suggestion", ""),
             "待处理",
+            "待处理",
+            "",
+            "",
             "、".join(issue.get("source_files", [])),
             "、".join(issue.get("source_sheets", [])),
             "；".join(option.get("label", "") for option in issue.get("action_options", [])),
@@ -1167,8 +1175,19 @@ def _populate_manual_issues_sheet(sheet: Any, issues: list[dict[str, Any]]) -> N
     for row in sheet.iter_rows(min_row=2):
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
+    outcome_validation = DataValidation(
+        type="list",
+        formula1='"待处理,更新到总表,保留总表"',
+        allow_blank=False,
+    )
+    outcome_validation.promptTitle = "人工处理结果"
+    outcome_validation.prompt = "选择“更新到总表”后填写处理值；选择“保留总表”将关闭该事项。"
+    outcome_validation.errorTitle = "请选择规定的处理结果"
+    outcome_validation.error = "仅支持：待处理、更新到总表、保留总表。"
+    sheet.add_data_validation(outcome_validation)
+    outcome_validation.add(f"J2:J{max(2, sheet.max_row)}")
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:L{max(1, sheet.max_row)}"
+    sheet.auto_filter.ref = f"A1:P{max(1, sheet.max_row)}"
     sheet.sheet_view.showGridLines = False
 
 

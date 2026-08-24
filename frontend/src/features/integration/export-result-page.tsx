@@ -12,6 +12,7 @@ import {
   FileSpreadsheet,
   Loader2,
   Save,
+  Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -54,6 +55,8 @@ export function ExportResultPage({ projectId }: { projectId: string }) {
   const [confirmingDepartmentTransfers, setConfirmingDepartmentTransfers] = useState(false);
   const [issueActions, setIssueActions] = useState<Record<string, string>>({});
   const [resolvingIssueId, setResolvingIssueId] = useState<string | null>(null);
+  const [manualReviewFile, setManualReviewFile] = useState<File | null>(null);
+  const [importingManualReview, setImportingManualReview] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -216,6 +219,25 @@ export function ExportResultPage({ projectId }: { projectId: string }) {
     }
   }
 
+  async function importManualReviewWorkbook() {
+    if (!manualReviewFile) return;
+    setImportingManualReview(true);
+    try {
+      const updated = await api.importManualReviewWorkbook(projectId, manualReviewFile);
+      setResult(updated);
+      setFilenameDraft(updated.filename);
+      setManualReviewFile(null);
+      setMasterPreview(null);
+      setReviewPreview(null);
+      setIssuesPreview(null);
+      toast.success("人工处理结果已更新到总表，并生成最新文件");
+    } catch (importError) {
+      toast.error(importError instanceof Error ? importError.message : "人工处理表导入失败");
+    } finally {
+      setImportingManualReview(false);
+    }
+  }
+
   if (loading) return <div className="mx-auto max-w-6xl py-16 text-center text-sm text-slate-500"><Loader2 className="mx-auto mb-3 h-5 w-5 animate-spin" />正在加载制作结果…</div>;
   if (!result) return <div className="mx-auto max-w-3xl rounded-xl border border-slate-200 bg-white p-6"><h1 className="text-xl font-semibold text-slate-950">暂未找到制作结果</h1><p className="mt-2 text-sm text-slate-600">{error || "请返回整合页，完成本月文件整合后再查收。"}</p><Button asChild className="mt-5 bg-sky-700 hover:bg-sky-800"><Link href={`/projects/${projectId}`}>返回整合页</Link></Button></div>;
 
@@ -228,7 +250,7 @@ export function ExportResultPage({ projectId }: { projectId: string }) {
         <Link href={`/projects/${projectId}`} className="text-sm text-slate-500 hover:text-slate-900">← 返回整合页</Link>
         <p className="mt-5 text-sm text-slate-500">{project?.salary_month || "本月"}工资交付</p>
         <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">基础数据更新完成</h1>
-        <p className="mt-2 text-sm leading-6 text-slate-600">正式稿用于业务使用，修改稿用于人工审核。修改稿与正式稿内容一致，仅以颜色标出新增行和已更新的单元格。</p>
+        <p className="mt-2 text-sm leading-6 text-slate-600">正式稿用于业务使用，修改稿用于人工审核。修改稿与正式稿内容一致，在变更单元格添加批注，并在“修改记录”表逐项列出原值、新值和位置。</p>
       </header>
 
       <section className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5">
@@ -251,7 +273,7 @@ export function ExportResultPage({ projectId }: { projectId: string }) {
               </div>
             </div>
             <div className="rounded-md border border-amber-300 bg-amber-50 p-3">
-              <p className="mb-2 text-xs font-semibold text-amber-900">修改稿（颜色标注版）</p>
+              <p className="mb-2 text-xs font-semibold text-amber-900">修改稿（批注与修改记录版）</p>
               <div className="grid grid-cols-2 gap-2">
                 <Button onClick={() => void previewReview()} variant="outline" disabled={previewing === "review"} className="border-amber-300 bg-white text-amber-900 hover:bg-amber-100">{previewing === "review" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Eye className="mr-2 h-4 w-4" />}预览</Button>
                 <Button onClick={() => void downloadReviewWorkbook()} disabled={downloading === "review"} className="bg-amber-700 text-white hover:bg-amber-800 disabled:bg-amber-700 disabled:text-white disabled:opacity-75">{downloading === "review" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载修改稿</Button>
@@ -265,8 +287,8 @@ export function ExportResultPage({ projectId }: { projectId: string }) {
       </section>
 
       <section className="rounded-xl border border-amber-200 bg-amber-50/50">
-        <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5"><button type="button" onClick={() => void toggleIssues()} className="flex min-w-0 flex-1 items-center justify-between gap-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-700 focus-visible:ring-inset" aria-expanded={issuesOpen}><span className="flex items-center gap-3"><AlertTriangle className="h-5 w-5 shrink-0 text-amber-700" /><span><span className="block text-sm font-semibold text-amber-950">待人工处理</span><span className="mt-1 block text-xs text-amber-800">单独文件，不写入工资核算总表；完成后才能定稿 · {result.issue_count} 项</span></span></span>{issuesOpen ? <ChevronUp className="h-5 w-5 shrink-0 text-amber-800" /> : <ChevronDown className="h-5 w-5 shrink-0 text-amber-800" />}</button><div className="flex flex-wrap gap-2"><Button type="button" onClick={() => void confirmSelectedDepartmentTransfers()} disabled={!selectedDepartmentIssueIds.length || confirmingDepartmentTransfers} className="shrink-0 border border-emerald-300 bg-emerald-100 text-emerald-900 hover:bg-emerald-200 disabled:border-emerald-300 disabled:bg-emerald-100 disabled:text-emerald-900 disabled:opacity-100">{confirmingDepartmentTransfers ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}确定更新已选择项</Button><Button onClick={() => void downloadManualIssuesWorkbook()} disabled={downloading !== null} className="shrink-0 border border-amber-300 bg-amber-100 text-amber-900 hover:bg-amber-200 disabled:border-amber-300 disabled:bg-amber-100 disabled:text-amber-900 disabled:opacity-100">{downloading === "issues" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载待人工处理</Button></div></div>
-        {issuesOpen ? <div className="border-t border-amber-200 px-4 pb-4 pt-4 sm:px-5"><div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div className="min-w-0"><p className="truncate text-sm font-medium text-slate-900">{result.issues_filename || "待人工处理.xlsx"}</p><p className="mt-1 text-xs text-slate-600">请按清单逐项确认公式、特殊人员、部门异动和其他累计调差。</p></div><Button onClick={() => void previewIssues()} variant="outline" disabled={previewing === "issues"} className="shrink-0">{previewing === "issues" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Eye className="mr-2 h-4 w-4" />}刷新预览</Button></div><WorkbookPreview preview={issuesPreview} /></div> : null}
+        <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5"><button type="button" onClick={() => void toggleIssues()} className="flex min-w-0 flex-1 items-center justify-between gap-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-700 focus-visible:ring-inset" aria-expanded={issuesOpen}><span className="flex items-center gap-3"><AlertTriangle className="h-5 w-5 shrink-0 text-amber-700" /><span><span className="block text-sm font-semibold text-amber-950">待人工处理</span><span className="mt-1 block text-xs text-amber-800">下载后可在“处理结果、处理值、处理备注”列填写，再导入更新总表 · {result.issue_count} 项</span></span></span>{issuesOpen ? <ChevronUp className="h-5 w-5 shrink-0 text-amber-800" /> : <ChevronDown className="h-5 w-5 shrink-0 text-amber-800" />}</button><div className="flex flex-wrap gap-2"><Button type="button" onClick={() => void confirmSelectedDepartmentTransfers()} disabled={!selectedDepartmentIssueIds.length || confirmingDepartmentTransfers} className="shrink-0 border border-emerald-300 bg-emerald-100 text-emerald-900 hover:bg-emerald-200 disabled:border-emerald-300 disabled:bg-emerald-100 disabled:text-emerald-900 disabled:opacity-100">{confirmingDepartmentTransfers ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}确定更新已选择项</Button><Button onClick={() => void downloadManualIssuesWorkbook()} disabled={downloading !== null} className="shrink-0 border border-amber-300 bg-amber-100 text-amber-900 hover:bg-amber-200 disabled:border-amber-300 disabled:bg-amber-100 disabled:text-amber-900 disabled:opacity-100">{downloading === "issues" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载待人工处理</Button></div></div>
+        {issuesOpen ? <div className="border-t border-amber-200 px-4 pb-4 pt-4 sm:px-5"><div className="flex flex-col gap-4"><div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div className="min-w-0"><p className="truncate text-sm font-medium text-slate-900">{result.issues_filename || "待人工处理.xlsx"}</p><p className="mt-1 text-xs text-slate-600">仅会回写可通过唯一工号和目标字段安全定位的已处理事项；无法安全定位的复杂项仍保留在清单中。</p></div><Button onClick={() => void previewIssues()} variant="outline" disabled={previewing === "issues"} className="shrink-0">{previewing === "issues" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Eye className="mr-2 h-4 w-4" />}刷新预览</Button></div><div className="flex flex-col gap-2 rounded-md border border-amber-200 bg-white p-3 sm:flex-row sm:items-center"><label className="min-w-0 flex-1"><span className="sr-only">选择已填写的人工处理表</span><Input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => setManualReviewFile(event.target.files?.[0] || null)} className="h-9 cursor-pointer bg-white text-xs" /></label><Button type="button" onClick={() => void importManualReviewWorkbook()} disabled={!manualReviewFile || importingManualReview} className="shrink-0 bg-emerald-700 hover:bg-emerald-800">{importingManualReview ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}导入并更新总表</Button></div>{manualReviewFile ? <p className="text-xs text-slate-600">待导入：{manualReviewFile.name}</p> : null}<WorkbookPreview preview={issuesPreview} /></div></div> : null}
       </section>
 
       <section className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5"><div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><FileSpreadsheet className="h-5 w-5 text-slate-500" /><h2 className="text-sm font-semibold text-slate-950">人工问题摘要</h2></div><span className="text-xs text-slate-500">共 {result.issues.length} 项</span></div>{result.issues.length ? <ul className="mt-3 divide-y divide-slate-200">{result.issues.map((issue, index) => {
