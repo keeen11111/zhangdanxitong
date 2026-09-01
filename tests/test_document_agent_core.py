@@ -160,7 +160,7 @@ def test_orchestrator_stops_repeated_tool_requests_before_repeating_a_write() ->
     assert write_count == 1
 
 
-def test_orchestrator_stops_a_repeated_read_even_when_other_reads_are_interleaved() -> None:
+def test_orchestrator_reports_repeated_read_without_blocking_the_run() -> None:
     class AlternatingReadProvider:
         def __init__(self) -> None:
             self.turn = 0
@@ -181,9 +181,14 @@ def test_orchestrator_stops_a_repeated_read_even_when_other_reads_are_interleave
         provider=AlternatingReadProvider(), registry=registry, max_turns=3,
     ).run(run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[])
 
-    assert result.status == "blocked"
-    assert result.code == "NO_PROGRESS_DETECTED"
+    assert result.status == "execution_incomplete"
+    assert result.code == "MAX_TURNS_EXCEEDED"
     assert reads == ["工资", "奖金"]
+    assert any(
+        event.type == "tool_result"
+        and str(event.payload.get("error") or "").startswith("该读取范围已读取过")
+        for event in result.events
+    )
 
 
 def test_orchestrator_keeps_model_context_bounded_for_long_projects() -> None:

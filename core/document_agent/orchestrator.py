@@ -305,24 +305,29 @@ class ModelOrchestrator:
                 previous_call_fingerprint = fingerprint
                 repeat_limit = 2 if call.name in WRITE_TOOL_NAMES else REPEATED_TOOL_CALL_LIMIT
                 if call.name not in WRITE_TOOL_NAMES and fingerprint in read_fingerprints_since_write:
+                    # Re-reading is harmless but does not advance the task.
+                    # Feed a deterministic tool error back to the same model
+                    # so it can choose a write, a different range, or finish;
+                    # reserve hard blocking for repeated write calls below.
                     revision += 1
                     record(AgentEvent(
-                        event_id=uuid4().hex,
-                        run_id=run_id,
-                        revision=revision,
-                        type="run_blocked",
-                        payload={
-                            "code": "NO_PROGRESS_DETECTED",
-                            "tool": call.name,
-                            "detail": "模型重复读取相同范围，已停止以避免重复消耗",
-                        },
+                        event_id=uuid4().hex, run_id=run_id, revision=revision,
+                        type="tool_call", payload={"call_id": call.call_id, "name": call.name}, item_id=None,
                     ))
-                    return OrchestrationResult(
-                        status="blocked",
-                        code="NO_PROGRESS_DETECTED",
-                        content=content,
-                        events=events,
-                    )
+                    revision += 1
+                    detail = "该读取范围已读取过，请改读尚未核对的范围，执行写入/校验，或明确说明未完成事项"
+                    record(AgentEvent(
+                        event_id=uuid4().hex, run_id=run_id, revision=revision,
+                        type="tool_result", payload={"call_id": call.call_id, "name": call.name, "status": "failed", "error": detail},
+                    ))
+                    turn_messages.append({
+                        "role": "tool", "tool_call_id": call.call_id, "name": call.name,
+                        "content": json.dumps({"error": detail}, ensure_ascii=False),
+                    })
+                    read_fingerprints_since_write.discard(fingerprint)
+                    repeated_call_count = 0
+                    previous_call_fingerprint = None
+                    continue
                 if repeated_call_count >= repeat_limit:
                     revision += 1
                     record(AgentEvent(
