@@ -168,6 +168,25 @@ def test_template_selection_only_uses_explicit_master_role(tmp_path, monkeypatch
     assert selected == (master, str(upload_dir / "master.xlsx"))
 
 
+def test_template_selection_accepts_existing_financial_master_for_payroll_export(tmp_path, monkeypatch) -> None:
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    (upload_dir / "master.xlsx").write_bytes(b"master")
+    master = UploadFile(
+        id="master-id",
+        project_id="project-id",
+        original_name="本月工资总表.xlsx",
+        stored_path="master.xlsx",
+        file_type="financial_master",
+    )
+    monkeypatch.setattr(pipeline, "UPLOAD_DIR", str(upload_dir))
+    monkeypatch.setattr(pipeline, "_supports_unified_export", lambda path: True)
+
+    selected = pipeline._select_template_file("project-id", _FakeDb([master]))
+
+    assert selected == (master, str(upload_dir / "master.xlsx"))
+
+
 def test_template_selection_blocks_multiple_explicit_masters_even_when_one_is_a_change(tmp_path, monkeypatch) -> None:
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
@@ -203,6 +222,26 @@ def test_source_signature_counts_only_master_and_change_roles() -> None:
     signature = pipeline._project_source_signature(rows)
 
     assert signature == pipeline._project_source_signature(rows[:2])
+
+
+def test_source_signature_includes_existing_financial_upload_roles() -> None:
+    rows = [
+        UploadFile(id="master", original_name="总表.xlsx", stored_path="m", file_type="financial_master"),
+        UploadFile(id="change", original_name="考勤.xlsx", stored_path="c", file_type="financial_source"),
+    ]
+
+    assert pipeline._project_source_signature(rows) != pipeline._project_source_signature([])
+
+
+def test_semantic_issue_key_is_stable_for_the_same_source_task() -> None:
+    issue = {
+        "issue_type": "empty_source_sheet",
+        "source_files": ["来源.xlsx"],
+        "source_sheets": ["补发补扣"],
+        "message": "来源 Sheet 没有可处理的数据记录，未自动写入。",
+    }
+
+    assert pipeline._semantic_issue_key(issue) == pipeline._semantic_issue_key(dict(issue))
 
 
 def test_pipeline_validation_accepts_complete_employee() -> None:

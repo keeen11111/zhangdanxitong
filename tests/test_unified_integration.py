@@ -15,6 +15,7 @@ from core.unified_integration import (
     export_unified_workbook,
     write_manual_issues_workbook,
     _normalize_manual_issues,
+    _matching_policy,
 )
 
 
@@ -220,7 +221,122 @@ def test_authoritative_roster_only_adds_people_confirmed_by_multiple_sources() -
     assert result["coverage_gap_count"] == 0
 
 
-def test_department_transfer_keeps_master_value_and_requires_manual_review() -> None:
+def test_unique_name_and_context_can_auto_link_record_without_strong_identity() -> None:
+    entities = {
+        "employee_profile": [
+            {
+                "工号": "E001",
+                "姓名": "甲",
+                "公司": "北京公司",
+                "部门": "零售部",
+                "_roster_authoritative": True,
+                "_source_file": "总表.xlsx",
+            },
+        ],
+        "salary_detail": [
+            {
+                "姓名": "甲",
+                "公司": "北京公司",
+                "部门": "零售部",
+                "月基本薪资": 8000,
+                "_source_file": "薪资.xlsx",
+            },
+        ],
+    }
+
+    result = build_complete_roster(entities)
+
+    assert result["output_person_count"] == 1
+    assert result["entities"]["salary_detail"][0]["_person_key"] == "employee:E001"
+    assert result["entities"]["salary_detail"][0]["_match_confidence"] >= 0.85
+    assert "姓名" in result["entities"]["salary_detail"][0]["_match_basis"]
+    assert not any(issue["issue_type"] == "unmatched_person" for issue in result["issues"])
+
+
+def test_same_name_with_conflicting_strong_identity_is_never_auto_linked() -> None:
+    entities = {
+        "employee_profile": [
+            {
+                "工号": "E001",
+                "姓名": "甲",
+                "公司": "北京公司",
+                "_roster_authoritative": True,
+                "_source_file": "总表.xlsx",
+            },
+        ],
+        "salary_detail": [
+            {
+                "工号": "E999",
+                "姓名": "甲",
+                "公司": "北京公司",
+                "月基本薪资": 8000,
+                "_source_file": "薪资.xlsx",
+            },
+        ],
+    }
+
+    result = build_complete_roster(entities)
+
+    assert [(row.get("工号"), row.get("姓名")) for row in result["entities"]["employee_profile"]] == [("E001", "甲")]
+    assert any(issue["issue_type"] == "identity_conflict_with_master" for issue in result["issues"])
+    assert not any(row.get("_person_key") == "employee:E001" for row in result["entities"]["salary_detail"])
+
+
+def test_same_name_with_multiple_authoritative_candidates_requires_manual_review() -> None:
+    entities = {
+        "employee_profile": [
+            {"工号": "E001", "姓名": "甲", "公司": "北京公司", "部门": "零售部", "_roster_authoritative": True},
+            {"工号": "E002", "姓名": "甲", "公司": "北京公司", "部门": "运营部", "_roster_authoritative": True},
+        ],
+        "salary_detail": [{"姓名": "甲", "公司": "北京公司", "部门": "财务部", "月基本薪资": 8000}],
+    }
+
+    result = build_complete_roster(entities)
+
+    assert result["output_person_count"] == 2
+    assert any(issue["issue_type"] == "ambiguous_person" for issue in result["issues"])
+
+
+def test_matching_policy_normalizes_weights_and_keeps_safe_threshold_floor() -> None:
+    threshold, weights = _matching_policy({
+        "auto_match_threshold": 0.2,
+        "field_weights": {"姓名": 2, "公司": 1, "部门": 1, "岗位": 0},
+    })
+
+    assert threshold == 0.85
+    assert round(sum(weights.values()), 6) == 1
+    assert weights["姓名"] == 0.5
+
+
+def test_matching_policy_can_force_a_source_sheet_to_manual_review() -> None:
+    entities = {
+        "employee_profile": [{"工号": "E001", "姓名": "甲", "公司": "北京公司", "部门": "零售部", "_roster_authoritative": True}],
+        "salary_detail": [{"姓名": "甲", "公司": "北京公司", "部门": "零售部", "_source_sheet": "临时表"}],
+    }
+
+    result = build_complete_roster(entities, salary_month="2026.08", matching_policy={
+        "source_rules": [{"source_sheet": "临时表", "month": "2026.08", "action": "review"}],
+    })
+
+    assert any(issue["issue_type"] == "unmatched_person" for issue in result["issues"])
+    assert "_person_key" not in result["entities"]["salary_detail"][0]
+
+
+def test_matching_policy_can_force_a_target_field_to_manual_review() -> None:
+    entities = {
+        "employee_profile": [{"工号": "E001", "姓名": "甲", "_roster_authoritative": True}],
+        "salary_detail": [{"工号": "E001", "姓名": "甲", "绩效奖金": 500, "_source_sheet": "奖金"}],
+    }
+
+    result = build_complete_roster(entities, salary_month="2026.08", matching_policy={
+        "source_rules": [{"source_sheet": "奖金", "target_field": "绩效奖金", "action": "review"}],
+    })
+
+    assert result["entities"]["salary_detail"][0]["绩效奖金"] is None
+    assert any(issue["issue_type"] == "configured_field_review" for issue in result["issues"])
+
+
+def test_department_transfer_overwrites_master_when_source_value_is_unique() -> None:
     entities = {
         "employee_profile": [
             {
@@ -243,14 +359,11 @@ def test_department_transfer_keeps_master_value_and_requires_manual_review() -> 
 
     result = build_complete_roster(entities)
 
-    assert result["entities"]["employee_profile"][0]["部门"] == "原部门"
-    issue = next(item for item in result["issues"] if item["issue_type"] == "department_transfer")
-    assert issue["person_name"] == "甲"
-    assert issue["target_field"] == "部门"
-    assert issue["source_files"] == ["人员异动.xlsx", "总表.xlsx"]
+    assert result["entities"]["employee_profile"][0]["部门"] == "新部门"
+    assert not any(item["issue_type"] == "department_transfer" for item in result["issues"])
 
 
-def test_department_leaf_name_does_not_override_master_hierarchy() -> None:
+def test_department_leaf_name_overwrites_master_when_source_value_is_unique() -> None:
     entities = {
         "employee_profile": [
             {
@@ -270,10 +383,11 @@ def test_department_leaf_name_does_not_override_master_hierarchy() -> None:
 
     result = build_complete_roster(entities)
 
-    assert any(issue["issue_type"] == "department_transfer" for issue in result["issues"])
+    assert result["entities"]["employee_profile"][0]["部门"] == "支持组"
+    assert not any(issue["issue_type"] == "department_transfer" for issue in result["issues"])
 
 
-def test_department_value_that_is_not_an_exact_match_requires_manual_review() -> None:
+def test_conflicting_department_sources_require_manual_review() -> None:
     entities = {
         "employee_profile": [
             {
@@ -282,21 +396,18 @@ def test_department_value_that_is_not_an_exact_match_requires_manual_review() ->
                 "部门": "零售业务北区-北京市-支持组",
                 "_roster_authoritative": True,
             },
-            {
-                "工号": "E001",
-                "姓名": "甲",
-                "部门": "支持组",
-                "_source_priority": 30,
-            },
+            {"工号": "E001", "姓名": "甲", "部门": "支持组", "_source_priority": 30},
+            {"工号": "E001", "姓名": "甲", "部门": "运营组", "_source_priority": 30},
         ],
     }
 
     result = build_complete_roster(entities)
 
-    assert any(issue["issue_type"] == "department_transfer" for issue in result["issues"])
+    assert result["entities"]["employee_profile"][0]["部门"] == "零售业务北区-北京市-支持组"
+    assert any(issue["issue_type"] == "conflicting_value" for issue in result["issues"])
 
 
-def test_department_containment_is_not_treated_as_the_same_department() -> None:
+def test_department_containment_overwrites_master_when_source_value_is_unique() -> None:
     entities = {
         "employee_profile": [
             {
@@ -316,7 +427,8 @@ def test_department_containment_is_not_treated_as_the_same_department() -> None:
 
     result = build_complete_roster(entities)
 
-    assert any(issue["issue_type"] == "department_transfer" for issue in result["issues"])
+    assert result["entities"]["employee_profile"][0]["部门"] == "大客户管理部"
+    assert not any(issue["issue_type"] == "department_transfer" for issue in result["issues"])
 
 
 def test_source_identity_conflict_with_master_is_excluded_for_manual_review() -> None:
@@ -372,6 +484,72 @@ def test_conflicting_source_values_are_left_blank_for_manual_review() -> None:
         and issue["target_field"] == "绩效奖金"
     )
     assert issue["candidate_values"] == [100, 200, 300]
+
+
+def test_current_month_attendance_and_bonus_override_previous_month_values() -> None:
+    entities = {
+        "employee_profile": [
+            {"工号": "E001", "姓名": "甲", "_roster_authoritative": True},
+        ],
+        "attendance_record": [
+            {"工号": "E001", "姓名": "甲", "实际出勤天数": 20, "_source_sheet": "考勤-6月"},
+            {"工号": "E001", "姓名": "甲", "实际出勤天数": 22, "_source_sheet": "考勤-7月"},
+        ],
+        "salary_detail": [
+            {"工号": "E001", "姓名": "甲", "绩效奖金": 100, "_source_sheet": "奖金-6月"},
+            {"工号": "E001", "姓名": "甲", "绩效奖金": 300, "_source_sheet": "奖金-7月"},
+        ],
+    }
+
+    result = build_complete_roster(entities, salary_month="2026.07")
+
+    assert result["entities"]["attendance_record"][0]["实际出勤天数"] == 22
+    assert result["entities"]["salary_detail"][0]["绩效奖金"] == 300
+    assert not any(
+        issue["issue_type"] == "conflicting_value"
+        and issue["target_field"] in {"实际出勤天数", "绩效奖金"}
+        for issue in result["issues"]
+    )
+
+
+def test_current_month_attendance_value_also_resolves_profile_field_conflicts() -> None:
+    entities = {
+        "employee_profile": [
+            {"工号": "E001", "姓名": "甲", "人员类别": "合同制", "_source_sheet": "考勤-6月"},
+            {"工号": "E001", "姓名": "甲", "人员类别": "劳务派遣", "_source_sheet": "考勤-7月"},
+        ],
+    }
+
+    result = build_complete_roster(entities, salary_month="2026.07")
+
+    assert result["entities"]["employee_profile"][0]["人员类别"] == "劳务派遣"
+    assert not any(
+        issue["issue_type"] == "conflicting_value" and issue["target_field"] == "人员类别"
+        for issue in result["issues"]
+    )
+
+
+def test_sheet_month_takes_priority_over_a_current_month_package_filename() -> None:
+    entities = {
+        "employee_profile": [
+            {
+                "工号": "E001", "姓名": "甲", "人员类别": "合同制",
+                "_source_file": "园区-7月薪资包.xlsx", "_source_sheet": "考勤-6月",
+            },
+            {
+                "工号": "E001", "姓名": "甲", "人员类别": "劳务派遣",
+                "_source_file": "园区-7月薪资包.xlsx", "_source_sheet": "考勤-7月",
+            },
+        ],
+    }
+
+    result = build_complete_roster(entities, salary_month="2026.07")
+
+    assert result["entities"]["employee_profile"][0]["人员类别"] == "劳务派遣"
+    assert not any(
+        issue["issue_type"] == "conflicting_value" and issue["target_field"] == "人员类别"
+        for issue in result["issues"]
+    )
 
 
 def test_conflicting_profile_values_are_left_blank_for_manual_review() -> None:
@@ -1038,19 +1216,22 @@ def test_review_workbook_annotates_changes_without_using_color_markers(tmp_path:
     audit = review["修改记录"]
     assert payroll["C2"].fill.patternType is None
     assert payroll["C2"].comment is not None
+    assert "位置：工资核算!C2" in payroll["C2"].comment.text
     assert "原值：8000" in payroll["C2"].comment.text
     assert "新值：9000" in payroll["C2"].comment.text
     assert payroll["A3"].comment is not None
     assert "本行新增" in payroll["A3"].comment.text
+    assert "位置：工资核算!A3" in payroll["A3"].comment.text
     assert audit.max_row == 3
     assert [cell.value for cell in audit[1]] == [
-        "序号", "工作表", "人员标识", "姓名", "变更类型", "字段", "原值", "新值", "单元格位置",
+        "序号", "工作表", "人员标识", "姓名", "变更类型", "字段", "原值", "新值", "单元格位置", "变更说明",
     ]
     assert [cell.value for cell in audit[2]] == [
-        1, "工资核算", "E001", "甲", "字段修改", "月基本薪资", 8000, 9000, "C2",
+        1, "工资核算", "E001", "甲", "字段修改", "月基本薪资", 8000, 9000, "C2", "工资核算!C2：甲的“月基本薪资”由“8000”改为“9000”",
     ]
     assert [cell.value for cell in audit[3]] == [
-        2, "工资核算", "E002", "乙", "新增行", "整行", None, None, "A3",
+        2, "工资核算", "E002", "乙", "新增行", "整行", None, None, "A3", "工资核算!A3：新增人员/记录“乙”",
     ]
+    assert audit.auto_filter.ref == "A1:J3"
     assert summary == {"change_count": 2, "audit_row_count": 2}
     review.close()

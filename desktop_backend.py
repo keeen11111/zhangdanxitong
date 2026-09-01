@@ -25,8 +25,9 @@ def install_builtin_templates() -> None:
 def main() -> None:
     install_builtin_templates()
     import uvicorn
+    from backend.main import app
 
-    uvicorn.run("backend.main:app", host="127.0.0.1", port=18000, log_level="warning")
+    uvicorn.run(app, host="127.0.0.1", port=18000, log_level="warning")
 
 
 if __name__ == "__main__":

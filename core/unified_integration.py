@@ -95,6 +95,64 @@ def _salary_month_cutoff(salary_month: str | None) -> date | None:
     return date(year, month, calendar.monthrange(year, month)[1])
 
 
+def _is_current_month_attendance_or_bonus_row(
+    row: dict[str, Any],
+    cutoff: date | None,
+) -> bool:
+    """Return whether an attendance/bonus source explicitly belongs to this payroll month."""
+    if cutoff is None:
+        return False
+    source_file = _text(row.get("_source_file"))
+    source_sheet = _text(row.get("_source_sheet"))
+    source_labels = f"{source_file} {source_sheet}"
+    if not source_labels or ("考勤" not in source_labels and "奖金" not in source_labels):
+        return False
+
+    def mentions_a_month(label: str) -> bool:
+        return bool(re.search(
+            r"(?<!\d)(?:20\d{2}[年.\-_/]?)?(?:0?[1-9]|1[0-2])月|20\d{2}(?:0[1-9]|1[0-2])",
+            label,
+        ))
+
+    def is_current_month(label: str) -> bool:
+        month = cutoff.month
+        year = cutoff.year
+        patterns = (
+            rf"{year}[年.\-_/]0?{month}(?:月)?",
+            rf"{year}{month:02d}",
+            rf"(?<!\d)0?{month}月",
+        )
+        return any(re.search(pattern, label) for pattern in patterns)
+
+    # A sheet-specific month is more precise than its enclosing workbook name:
+    # a July payroll package often contains both 考勤-6月 and 考勤-7月 sheets.
+    if mentions_a_month(source_sheet):
+        return is_current_month(source_sheet)
+    return is_current_month(source_file)
+
+
+def _current_month_attendance_or_bonus_value(
+    rows: list[dict[str, Any]],
+    field: str,
+    cutoff: date | None,
+) -> tuple[bool, Any]:
+    """Choose one unambiguous current-month attendance/bonus value, if present."""
+    current_month_values: list[Any] = []
+    value_keys: set[str] = set()
+    for row in rows:
+        if not _is_current_month_attendance_or_bonus_row(row, cutoff):
+            continue
+        value = row.get(field)
+        value_key = _text(value)
+        if value in (None, "") or value_key in value_keys:
+            continue
+        current_month_values.append(value)
+        value_keys.add(value_key)
+    if len(current_month_values) == 1:
+        return True, current_month_values[0]
+    return False, None
+
+
 def _record_effective_date(record: dict[str, Any]) -> date | None:
     for field in (
         "_effective_date",
@@ -361,9 +419,83 @@ def _append_date_resolution_issues(
         })
 
 
+_DEFAULT_MATCHING_POLICY: dict[str, Any] = {
+    "auto_match_threshold": 0.85,
+    "field_weights": {"姓名": 0.50, "公司": 0.25, "部门": 0.15, "岗位": 0.10},
+}
+
+
+def _matching_policy(policy: dict[str, Any] | None) -> tuple[float, dict[str, float]]:
+    """Normalize a project policy while keeping a conservative lower bound."""
+    raw = policy if isinstance(policy, dict) else {}
+    try:
+        threshold = float(raw.get("auto_match_threshold", 0.85))
+    except (TypeError, ValueError):
+        threshold = 0.85
+    threshold = min(0.99, max(0.85, threshold))
+    weights = {"姓名": 0.50, "公司": 0.25, "部门": 0.15, "岗位": 0.10}
+    raw_weights = raw.get("field_weights")
+    if isinstance(raw_weights, dict):
+        for field, value in raw_weights.items():
+            if field not in weights:
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                weights[field] = parsed
+    total = sum(weights.values()) or 1.0
+    return threshold, {field: value / total for field, value in weights.items()}
+
+
+def _score_authoritative_candidate(
+    row: dict[str, Any], candidate: dict[str, Any], weights: dict[str, float]
+) -> tuple[float, list[str]]:
+    basis: list[str] = []
+    score = 0.0
+    for field, weight in weights.items():
+        source = _header(row.get(field))
+        target = _header(candidate.get(field))
+        if source and target and source == target:
+            score += weight
+            basis.append(field)
+    return score, basis
+
+
+def _matching_rule_action(policy: dict[str, Any] | None, row: dict[str, Any], salary_month: str | None = None) -> str | None:
+    """Return the most specific configured action for a source Sheet/field."""
+    if not isinstance(policy, dict):
+        return None
+    matches: list[tuple[int, str]] = []
+    for rule in policy.get("source_rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        source_sheet = _text(rule.get("source_sheet"))
+        row_sheet = _text(row.get("_source_sheet"))
+        if source_sheet and source_sheet != row_sheet:
+            continue
+        company = _text(rule.get("company"))
+        if company and company != _text(row.get("公司")):
+            continue
+        month = _text(rule.get("month"))
+        if month and salary_month and month != salary_month:
+            continue
+        target_field = _text(rule.get("target_field"))
+        if target_field and target_field not in row:
+            continue
+        action = _text(rule.get("action"))
+        if action not in {"allow", "review", "ignore"}:
+            continue
+        specificity = sum(bool(_text(rule.get(key))) for key in ("source_sheet", "company", "month", "target_field"))
+        matches.append((specificity, action))
+    return max(matches, key=lambda entry: entry[0])[1] if matches else None
+
+
 def build_complete_roster(
     entities: dict[str, list[dict]],
     salary_month: str | None = None,
+    matching_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把所有实体中的有效人员组成并集，并给关联记录写入内部人员键。
 
@@ -371,6 +503,7 @@ def build_complete_roster(
     仅有姓名或同名但强标识不同的记录均进入待人工处理，避免误写总表。
     """
     cutoff = _salary_month_cutoff(salary_month)
+    auto_match_threshold, match_weights = _matching_policy(matching_policy)
     copied = {
         entity_id: [dict(row) for row in rows if isinstance(row, dict)]
         for entity_id, rows in deepcopy(entities).items()
@@ -382,9 +515,12 @@ def build_complete_roster(
         for row in copied.get("employee_profile", [])
         if row.get("_roster_authoritative")
     ]
+    for anchor, row in enumerate(authoritative_profiles):
+        row["_roster_anchor"] = f"authoritative:{anchor}"
     admitted_tokens: set[tuple[str, str]] = set()
     unmatched_groups: dict[str, list[dict[str, Any]]] = {}
     identity_conflict_groups: dict[str, list[dict[str, Any]]] = {}
+    ambiguous_identity_groups: dict[str, list[dict[str, Any]]] = {}
     authoritative_by_name: dict[str, dict[str, set[str]]] = {}
     if authoritative_profiles:
         for row in authoritative_profiles:
@@ -431,8 +567,30 @@ def build_complete_roster(
             employee_id = _text(row.get("工号")).upper() if _valid_employee_id(row.get("工号")) else ""
             id_card = _text(row.get("身份证号")).upper()
             if not (employee_id or id_card):
-                if _valid_name(name):
+                configured_action = _matching_rule_action(matching_policy, row, salary_month)
+                if configured_action in {"review", "ignore"}:
+                    if _valid_name(name):
+                        unmatched_groups.setdefault(name, []).append(row)
+                    continue
+                candidates = [
+                    candidate for candidate in authoritative_profiles
+                    if _text(candidate.get("姓名")) == name and _valid_name(name)
+                ]
+                if len(candidates) == 1:
+                    score, basis = _score_authoritative_candidate(row, candidates[0], match_weights)
+                    if score >= auto_match_threshold:
+                        row["_roster_anchor"] = candidates[0].get("_roster_anchor")
+                        row["_match_confidence"] = round(score, 4)
+                        row["_match_basis"] = basis
+                    elif _valid_name(name):
+                        unmatched_groups.setdefault(name, []).append(row)
+                elif len(candidates) > 1 and _valid_name(name):
+                    ambiguous_identity_groups.setdefault(name, []).append(row)
+                elif _valid_name(name):
                     unmatched_groups.setdefault(name, []).append(row)
+                if not row.get("_roster_anchor"):
+                    continue
+                records.append((entity_id, row))
                 continue
             if authoritative_profiles:
                 master_identity = authoritative_by_name.get(name)
@@ -480,6 +638,16 @@ def build_complete_roster(
             else:
                 seen[value] = index
 
+    anchor_seen: dict[str, int] = {}
+    for index, (_, row) in enumerate(records):
+        anchor = _text(row.get("_roster_anchor"))
+        if not anchor:
+            continue
+        if anchor in anchor_seen:
+            union(anchor_seen[anchor], index)
+        else:
+            anchor_seen[anchor] = index
+
     issues: list[dict[str, Any]] = [
         _person_issue(
             "unmatched_person",
@@ -501,6 +669,15 @@ def build_complete_roster(
             ],
         )
         for name, rows in identity_conflict_groups.items()
+    )
+    issues.extend(
+        _person_issue(
+            "ambiguous_person",
+            name,
+            "同名记录对应多个总表人员，未自动合并；请人工确认身份。",
+            rows + [row for row in authoritative_profiles if _text(row.get("姓名")) == name],
+        )
+        for name, rows in ambiguous_identity_groups.items()
     )
     by_name: dict[str, list[int]] = {}
     for index, (_, row) in enumerate(records):
@@ -555,6 +732,12 @@ def build_complete_roster(
                 continue
             if resolution["status"] in {"conflict", "missing_date"}:
                 profile[field] = None
+                continue
+            has_current_month_value, current_month_value = (
+                _current_month_attendance_or_bonus_value(field_rows, field, cutoff)
+            )
+            if has_current_month_value:
+                profile[field] = current_month_value
                 continue
             values: list[Any] = []
             value_keys: set[str] = set()
@@ -627,15 +810,23 @@ def build_complete_roster(
                     and _text(row.get(field))
                 )
             }
-            values_conflict = (
-                any(
-                    not any(_same_department(master, value) for master in master_values)
-                    for value in change_values
-                )
-                if field == "部门"
-                else any(value not in master_values for value in change_values)
-            )
-            if len(master_values) == 1:
+            if len(change_values) == 1:
+                # A uniquely identified change source is newer than the master.
+                # Organizational fields are not an automatic-review blacklist.
+                profile[field] = next(iter(change_values))
+            elif len(change_values) > 1:
+                profile[field] = next(iter(master_values)) if len(master_values) == 1 else None
+                issues.append({
+                    **_person_issue(
+                        "conflicting_value",
+                        _text(next((row.get("姓名") for row in component_rows if _valid_name(row.get("姓名"))), "")),
+                        f"{field}在多个变更来源中不一致，未自动覆盖。",
+                        component_rows,
+                    ),
+                    "target_field": field,
+                    "candidate_values": sorted(change_values),
+                })
+            elif len(master_values) == 1:
                 profile[field] = next(iter(master_values))
             elif len(master_values) > 1:
                 profile[field] = None
@@ -648,37 +839,6 @@ def build_complete_roster(
                     ),
                     "target_field": field,
                     "candidate_values": sorted(master_values),
-                })
-            if master_values and values_conflict:
-                issue_type = "department_transfer" if field == "部门" else "organizational_change"
-                issues.append({
-                    **_person_issue(
-                        issue_type,
-                        _text(next((row.get("姓名") for row in component_rows if _valid_name(row.get("姓名"))), "")),
-                        f"{field}从总表值“{'、'.join(sorted(master_values))}”变更为“{'、'.join(sorted(change_values))}”，未自动覆盖，请人工确认。",
-                        component_rows,
-                    ),
-                    "target_field": field,
-                    "employee_id": _text(profile.get("工号")),
-                    "current_value": "、".join(sorted(master_values)),
-                    "proposed_value": (
-                        next(iter(change_values)) if len(change_values) == 1 else None
-                    ),
-                    "candidate_values": sorted(change_values),
-                })
-            elif not master_values and len(change_values) == 1:
-                profile[field] = next(iter(change_values))
-            elif not master_values and len(change_values) > 1:
-                profile[field] = None
-                issues.append({
-                    **_person_issue(
-                        "conflicting_value",
-                        _text(next((row.get("姓名") for row in component_rows if _valid_name(row.get("姓名"))), "")),
-                        f"{field}在多个来源中不一致，目标字段已留空。",
-                        component_rows,
-                    ),
-                    "target_field": field,
-                    "candidate_values": sorted(change_values),
                 })
 
         for field in ("工号", "姓名", "身份证号"):
@@ -725,9 +885,21 @@ def build_complete_roster(
         profile["_person_key"] = person_key
         profile["_source_files"] = sorted({_text(row.get("_source_file")) for row in component_rows if row.get("_source_file")})
         profile["_source_sheets"] = sorted({_text(row.get("_source_sheet")) for row in component_rows if row.get("_source_sheet")})
+        profile_confidence = 1.0 if any(row.get("_roster_authoritative") for row in component_rows) else None
+        profile_basis: list[str] = []
+        for field in ("工号", "身份证号", "姓名", "公司", "部门", "岗位"):
+            value = _header(profile.get(field))
+            if value and any(_header(row.get(field)) == value for row in component_rows):
+                profile_basis.append(field)
+        if profile_confidence is not None:
+            profile["_match_confidence"] = profile_confidence
+            profile["_match_basis"] = profile_basis
         roster.append(profile)
         for index in indexes:
             records[index][1]["_person_key"] = person_key
+            if "_match_confidence" not in records[index][1]:
+                records[index][1]["_match_confidence"] = profile_confidence or 1.0
+                records[index][1]["_match_basis"] = profile_basis
 
     copied["employee_profile"] = roster
 
@@ -746,6 +918,12 @@ def build_complete_roster(
         consolidated: list[dict[str, Any]] = []
         for person_key, group in grouped.items():
             merged: dict[str, Any] = {"_person_key": person_key}
+            confidences = [row.get("_match_confidence") for row in group if isinstance(row.get("_match_confidence"), (int, float))]
+            bases = sorted({field for row in group for field in (row.get("_match_basis") or []) if isinstance(field, str)})
+            if confidences:
+                merged["_match_confidence"] = max(confidences)
+            if bases:
+                merged["_match_basis"] = bases
             fields = {
                 field
                 for row in group
@@ -760,6 +938,35 @@ def build_complete_roster(
                     (row.get("姓名") for row in group if _valid_name(row.get("姓名"))),
                     "",
                 ))
+                rule_actions = {
+                    _matching_rule_action(matching_policy, row, salary_month)
+                    for row in field_rows
+                }
+                if "ignore" in rule_actions:
+                    merged[field] = None
+                    issues.append({
+                        **_person_issue(
+                            "configured_field_ignored",
+                            person_name,
+                            f"匹配策略已配置忽略来源字段“{field}”，本次未写入。",
+                            field_rows,
+                        ),
+                        "target_field": field,
+                    })
+                    continue
+                if "review" in rule_actions:
+                    merged[field] = None
+                    issues.append({
+                        **_person_issue(
+                            "configured_field_review",
+                            person_name,
+                            f"匹配策略要求人工确认来源字段“{field}”，本次未自动覆盖。",
+                            field_rows,
+                        ),
+                        "target_field": field,
+                        "candidate_values": sorted({_text(row.get(field)) for row in field_rows if _text(row.get(field))}),
+                    })
+                    continue
                 resolution = _dated_field_resolution(field_rows, field, cutoff)
                 _append_date_resolution_issues(
                     issues, resolution, person_name, field, field_rows
@@ -769,6 +976,12 @@ def build_complete_roster(
                     continue
                 if resolution["status"] in {"conflict", "missing_date"}:
                     merged[field] = None
+                    continue
+                has_current_month_value, current_month_value = (
+                    _current_month_attendance_or_bonus_value(field_rows, field, cutoff)
+                )
+                if has_current_month_value:
+                    merged[field] = current_month_value
                     continue
                 values: list[Any] = []
                 value_keys: list[str] = []
@@ -818,6 +1031,7 @@ def build_complete_roster(
 def combine_entity_sources(
     *sources: dict[str, list[dict]],
     salary_month: str | None = None,
+    matching_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """按上传顺序汇集实体，再构建不会漏人的统一人员清单。"""
     combined: dict[str, list[dict]] = {}
@@ -828,7 +1042,7 @@ def combine_entity_sources(
             combined.setdefault(entity_id, []).extend(
                 dict(row) for row in rows if isinstance(row, dict)
             )
-    return build_complete_roster(combined, salary_month=salary_month)
+    return build_complete_roster(combined, salary_month=salary_month, matching_policy=matching_policy)
 
 
 def _missing_value_issues(entities: dict[str, list[dict]]) -> list[dict[str, Any]]:
@@ -874,6 +1088,8 @@ _ISSUE_DIFFICULTY = {
     "conflicting_identity": "复杂",
     "effective_date_conflict": "复杂",
     "future_effective_date": "一般",
+    "configured_field_ignored": "一般",
+    "configured_field_review": "一般",
 }
 _DIFFICULTY_RANK = {"简单": 0, "一般": 1, "复杂": 2}
 _ISSUE_TYPE_LABELS = {
@@ -888,6 +1104,8 @@ _ISSUE_TYPE_LABELS = {
     "ambiguous_person": "人员匹配",
     "identity_conflict_with_master": "人员匹配",
     "conflicting_identity": "人员匹配",
+    "configured_field_ignored": "策略控制",
+    "configured_field_review": "策略控制",
 }
 
 
@@ -1035,18 +1253,34 @@ def _append_review_comment(cell: Any, message: str) -> None:
     cell.comment = Comment(content, _REVIEW_COMMENT_AUTHOR)
 
 
+def _review_change_description(
+    sheet_name: str,
+    coordinate: str,
+    person_name: str,
+    employee_id: str,
+    field: str,
+    old_value: Any,
+    new_value: Any,
+) -> str:
+    subject = person_name or employee_id or "该记录"
+    return (
+        f"{sheet_name}!{coordinate}：{subject}的“{field}”"
+        f"由“{_review_text(old_value) or '空'}”改为“{_review_text(new_value) or '空'}”"
+    )
+
+
 def _review_audit_sheet(workbook: Any, audit_rows: list[list[Any]]) -> None:
     if _REVIEW_AUDIT_SHEET in workbook.sheetnames:
         workbook.remove(workbook[_REVIEW_AUDIT_SHEET])
     sheet = workbook.create_sheet(_REVIEW_AUDIT_SHEET)
     headers = [
-        "序号", "工作表", "人员标识", "姓名", "变更类型", "字段", "原值", "新值", "单元格位置",
+        "序号", "工作表", "人员标识", "姓名", "变更类型", "字段", "原值", "新值", "单元格位置", "变更说明",
     ]
     sheet.append(headers)
     for index, row in enumerate(audit_rows, start=1):
         sheet.append([index, *row])
 
-    widths = {"A": 8, "B": 20, "C": 18, "D": 14, "E": 12, "F": 22, "G": 24, "H": 24, "I": 16}
+    widths = {"A": 8, "B": 20, "C": 18, "D": 14, "E": 12, "F": 22, "G": 24, "H": 24, "I": 16, "J": 58}
     header_fill = PatternFill("solid", fgColor="1F4E78")
     for cell in sheet[1]:
         cell.fill = header_fill
@@ -1058,7 +1292,7 @@ def _review_audit_sheet(workbook: Any, audit_rows: list[list[Any]]) -> None:
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:I{max(1, sheet.max_row)}"
+    sheet.auto_filter.ref = f"A1:J{max(1, sheet.max_row)}"
     sheet.sheet_view.showGridLines = False
 
 
@@ -1094,9 +1328,13 @@ def create_review_workbook(
                             1,
                         )
                     marker_cell = review_sheet.cell(final_row, marker_column)
-                    _append_review_comment(marker_cell, "本行新增：该人员/记录为本次更新新增。")
+                    _append_review_comment(
+                        marker_cell,
+                        f"本行新增：该人员/记录为本次更新新增。\n位置：{review_sheet.title}!{marker_cell.coordinate}",
+                    )
                     audit_rows.append([
                         review_sheet.title, employee_id or key, person_name, "新增行", "整行", "", "", marker_cell.coordinate,
+                        f"{review_sheet.title}!{marker_cell.coordinate}：新增人员/记录“{person_name or employee_id or key}”",
                     ])
                     continue
                 base_row = base_rows[key]
@@ -1111,12 +1349,21 @@ def create_review_workbook(
                         field = headers.get(column) or f"第{column}列"
                         _append_review_comment(
                             final_cell,
-                            f"本次更新\n字段：{field}\n原值：{_review_text(base_value)}\n新值：{_review_text(final_value)}",
+                            f"本次更新\n位置：{review_sheet.title}!{final_cell.coordinate}\n字段：{field}\n原值：{_review_text(base_value)}\n新值：{_review_text(final_value)}",
                         )
                         audit_rows.append([
                             review_sheet.title, employee_id or key, person_name, "字段修改", field,
                             base_value if base_value is not None else "", final_value if final_value is not None else "",
                             final_cell.coordinate,
+                            _review_change_description(
+                                review_sheet.title,
+                                final_cell.coordinate,
+                                person_name,
+                                employee_id or key,
+                                field,
+                                base_value,
+                                final_value,
+                            ),
                         ])
         _review_audit_sheet(review, audit_rows)
         review.save(review_path)

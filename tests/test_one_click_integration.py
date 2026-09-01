@@ -6,6 +6,7 @@ import re
 from io import BytesIO
 from types import SimpleNamespace
 from zipfile import ZipFile
+from xml.etree import ElementTree
 
 import openpyxl
 import pandas as pd
@@ -15,8 +16,13 @@ from openpyxl.drawing.image import Image
 from openpyxl.worksheet.formula import ArrayFormula
 
 import backend.routers.pipeline as pipeline_module
+import backend.routers.projects as projects_module
+from backend.main import app
 from backend.routers.pipeline import (
     _build_export_preview,
+    _can_update_manual_issue_online,
+    _apply_manual_review_decisions,
+    _assign_manual_issue_ids,
     _apply_manual_review_workbook,
     _choose_template_candidate,
     _copy_source_workbooks,
@@ -26,6 +32,7 @@ from backend.routers.pipeline import (
     _content_disposition,
     _ensure_manual_issues_export,
     _load_current_export_meta,
+    _attach_manual_issue_locations,
     _project_source_signature,
     _normalize_export_filename,
     _extract_master_salary_month,
@@ -39,6 +46,8 @@ from backend.routers.pipeline import (
 from core.entity_engine import import_file_to_entities
 from backend.routers.projects import (
     _classify_uploaded_workbook,
+    _convert_legacy_excel_with_desktop_excel,
+    _inspect_ooxml_workbook,
     _normalize_excel_content,
     _read_upload_content,
     _validate_declared_workbook_role,
@@ -55,6 +64,54 @@ TINY_PNG = base64.b64decode(
 )
 
 
+def test_ooxml_inspection_calculates_dimensions_when_reader_reports_none(monkeypatch) -> None:
+    class SheetWithUnknownDimensions:
+        max_row = None
+        max_column = None
+
+        def calculate_dimension(self, force: bool = False):
+            assert force is True
+            self.max_row = 3
+            self.max_column = 3
+            return "A1:C3"
+
+        def cell(self, row: int, column: int):
+            assert (row, column) == (1, 1)
+            return SimpleNamespace(value="姓名")
+
+    class WorkbookWithUnknownDimensions:
+        sheetnames = ["工资"]
+        worksheets = [SheetWithUnknownDimensions()]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        projects_module.openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: WorkbookWithUnknownDimensions(),
+    )
+
+    assert _inspect_ooxml_workbook(b"valid workbook bytes") == {
+        "sheet_names": ["工资"],
+        "row_count": 3,
+        "col_count": 3,
+    }
+
+
+def test_batch_upload_accepts_a_transient_workbook_password() -> None:
+    schema = app.openapi()
+    request_body = schema["paths"]["/api/projects/{project_id}/files/batch-auto"]["post"]["requestBody"]
+    content = request_body["content"]["multipart/form-data"]["schema"]
+    form_schema = schema["components"]["schemas"][content["$ref"].rsplit("/", maxsplit=1)[-1]]
+
+    password_schema = form_schema["properties"]["password"]
+    assert any(
+        item.get("type") == "string" and item.get("maxLength") == 256
+        for item in password_schema["anyOf"]
+    )
+
+
 def _add_tiny_image(sheet, tmp_path, filename: str = "tiny.png") -> None:
     image_path = tmp_path / filename
     image_path.write_bytes(TINY_PNG)
@@ -68,14 +125,16 @@ def _add_cached_value_to_formula_cell(path, sheet_xml_name: str, coordinate: str
         for item in source_archive.infolist():
             payload = source_archive.read(item.filename)
             if item.filename == sheet_xml_name:
-                text = payload.decode("utf-8")
-                pattern = re.compile(
-                    rf'(<c r="{re.escape(coordinate)}"[^>]*>.*?<f>.*?</f>)(?:<v>.*?</v>)?(</c>)',
-                    re.DOTALL,
-                )
-                text, count = pattern.subn(rf"\1<v>{value}</v>\2", text, count=1)
-                assert count == 1
-                payload = text.encode("utf-8")
+                root = ElementTree.fromstring(payload)
+                namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+                cell = root.find(f".//{namespace}c[@r='{coordinate}']")
+                assert cell is not None
+                assert cell.find(f"{namespace}f") is not None
+                cached_value = cell.find(f"{namespace}v")
+                if cached_value is None:
+                    cached_value = ElementTree.SubElement(cell, f"{namespace}v")
+                cached_value.text = value
+                payload = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
             target_archive.writestr(item, payload)
     temporary_path.replace(path)
 
@@ -99,6 +158,100 @@ def test_regular_business_workbook_is_source() -> None:
     result = _classify_uploaded_workbook("6月考勤.xlsx", sheets)
 
     assert result == "source"
+
+
+def test_attaches_exact_sheet_and_cell_for_manual_issue(tmp_path) -> None:
+    workbook_path = tmp_path / "最终总表.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "工资核算"
+    sheet.append(["工号", "姓名", "绩效奖金"])
+    sheet.append(["E001", "甲", 1000])
+    workbook.save(workbook_path)
+    workbook.close()
+
+    issues = [{
+        "issue_id": "manual-1",
+        "employee_id": "E001",
+        "person_name": "甲",
+        "target_field": "绩效奖金",
+    }]
+
+    _attach_manual_issue_locations(str(workbook_path), issues)
+
+    assert issues[0]["target_sheet"] == "工资核算"
+    assert issues[0]["target_cell"] == "C2"
+    assert issues[0]["target_location"] == "工资核算!C2"
+
+
+def test_attaches_locations_when_the_workbook_row_has_empty_cells(tmp_path) -> None:
+    workbook_path = tmp_path / "稀疏总表.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "工资核算"
+    sheet.append(["工号", "姓名", "绩效奖金", "备注"])
+    sheet.append(["E001", "甲", 500])
+    workbook.save(workbook_path)
+    workbook.close()
+    issues = [{
+        "employee_id": "E001",
+        "person_name": "甲",
+        "target_field": "绩效奖金",
+    }]
+
+    _attach_manual_issue_locations(str(workbook_path), issues)
+
+    assert issues[0]["target_location"] == "工资核算!C2"
+
+
+def test_latest_export_reuses_saved_issue_locations_without_rescanning_workbook(tmp_path, monkeypatch) -> None:
+    """成果页刷新应直接复用导出时保存的定位信息，不能再次遍历完整总表。"""
+    export_path = tmp_path / "最终总表.xlsx"
+    export_path.write_bytes(b"already generated")
+    meta = {
+        "filename": "最终总表.xlsx",
+        "path": "最终总表.xlsx",
+        "issues": [],
+    }
+
+    monkeypatch.setattr(pipeline_module, "EXPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        pipeline_module,
+        "_load_project_or_404",
+        lambda *_: SimpleNamespace(id="project-1"),
+    )
+    monkeypatch.setattr(pipeline_module, "_load_current_export_meta", lambda *_: meta)
+    monkeypatch.setattr(pipeline_module, "_load_json", lambda *_: {"entities": {}, "issues": []})
+    monkeypatch.setattr(
+        pipeline_module,
+        "_attach_manual_issue_locations",
+        lambda *_: pytest.fail("成果查询不应重新扫描导出的 Excel"),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_ensure_manual_issues_export",
+        lambda *_: ("待人工处理_最终总表.xlsx", str(tmp_path / "待人工处理_最终总表.xlsx")),
+    )
+
+    result = pipeline_module.get_latest_pipeline_export("project-1", SimpleNamespace(), object())
+
+    assert result.filename == "最终总表.xlsx"
+    assert result.issues == []
+
+
+def test_marks_uniquely_matched_manual_issue_editable_even_without_excel_location() -> None:
+    final_data = {
+        "entities": {
+            "employee_profile": [{"工号": "E001", "姓名": "甲", "岗位": "药师"}],
+        },
+    }
+    issue = {"issue_id": "job-change", "person_name": "甲", "target_field": "岗位"}
+
+    assert _can_update_manual_issue_online(final_data, issue) is True
+    assert _can_update_manual_issue_online(
+        final_data,
+        {"issue_id": "unmatched", "person_name": "乙", "target_field": "岗位"},
+    ) is False
 
 
 def test_image_only_workbook_is_accepted_as_source_data(tmp_path) -> None:
@@ -131,30 +284,45 @@ def test_encrypted_ooxml_content_is_detected_as_xlsx_even_with_ole_container() -
     assert _workbook_binary_kind(encrypted_ooxml) == "xlsx-encrypted"
 
 
-def test_encrypted_ooxml_normalization_uses_xlsx_source_extension(monkeypatch) -> None:
+def test_encrypted_ooxml_normalization_fails_fast_without_desktop_conversion(monkeypatch) -> None:
     encrypted_ooxml = (
         bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")
         + "EncryptionInfo".encode("utf-16le")
         + "EncryptedPackage".encode("utf-16le")
     )
-    calls: list[str] = []
-
-    def convert(content: bytes, source_extension: str = ".xls") -> bytes:
-        calls.append(source_extension)
-        workbook = BytesIO()
-        openpyxl.Workbook().save(workbook)
-        return workbook.getvalue()
-
     monkeypatch.setattr(
         "backend.routers.projects._convert_legacy_excel_with_desktop_excel",
-        convert,
+        lambda *_args: (_ for _ in ()).throw(AssertionError("unexpected conversion")),
     )
 
-    normalized, extension = _normalize_excel_content(encrypted_ooxml)
+    with pytest.raises(HTTPException, match="加密") as exc_info:
+        _normalize_excel_content(encrypted_ooxml)
 
-    assert normalized.startswith(b"PK\x03\x04")
+    assert exc_info.value.status_code == 400
+
+
+def test_encrypted_ooxml_normalization_uses_the_supplied_password_in_memory(monkeypatch) -> None:
+    encrypted_ooxml = (
+        bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")
+        + "EncryptionInfo".encode("utf-16le")
+        + "EncryptedPackage".encode("utf-16le")
+    )
+    workbook_bytes = BytesIO()
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "已解密"
+    workbook.save(workbook_bytes)
+
+    def decrypt(content: bytes, password: str) -> bytes:
+        assert content == encrypted_ooxml
+        assert password == "打开密码"
+        return workbook_bytes.getvalue()
+
+    monkeypatch.setattr(projects_module, "_decrypt_encrypted_ooxml", decrypt)
+
+    normalized, extension = _normalize_excel_content(encrypted_ooxml, "打开密码")
+
     assert extension == ".xlsx"
-    assert calls == [".xlsx"]
+    assert normalized == workbook_bytes.getvalue()
 
 
 def test_ooxml_upload_does_not_invoke_desktop_conversion(monkeypatch) -> None:
@@ -171,6 +339,70 @@ def test_ooxml_upload_does_not_invoke_desktop_conversion(monkeypatch) -> None:
 
     assert normalized == content
     assert extension == ".xlsx"
+
+
+def test_legacy_conversion_timeout_preserves_actionable_error(monkeypatch) -> None:
+    real_temporary_directory = projects_module.tempfile.TemporaryDirectory
+    cleanup_options: list[bool] = []
+
+    def safe_temporary_directory(*, prefix: str, ignore_cleanup_errors: bool = False):
+        cleanup_options.append(ignore_cleanup_errors)
+        return real_temporary_directory(
+            prefix=prefix,
+            ignore_cleanup_errors=ignore_cleanup_errors,
+        )
+
+    class HangingProcess:
+        args = ["powershell.exe"]
+        returncode = -9
+
+        def __init__(self) -> None:
+            self.killed = False
+
+        def communicate(self, **_kwargs):
+            if not self.killed:
+                raise projects_module.subprocess.TimeoutExpired(cmd="powershell.exe", timeout=60)
+            return "", ""
+
+        def kill(self) -> None:
+            self.killed = True
+
+    monkeypatch.setattr(projects_module.tempfile, "TemporaryDirectory", safe_temporary_directory)
+    monkeypatch.setattr(projects_module.subprocess, "Popen", lambda *_args, **_kwargs: HangingProcess())
+
+    with pytest.raises(HTTPException, match="60 秒") as exc_info:
+        _convert_legacy_excel_with_desktop_excel(b"legacy workbook")
+
+    assert exc_info.value.status_code == 408
+    assert cleanup_options == [True]
+
+
+def test_legacy_conversion_timeout_terminates_converter_process(monkeypatch) -> None:
+    class HangingProcess:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.communicate_calls = 0
+
+        def communicate(self, **_kwargs):
+            self.communicate_calls += 1
+            if not self.killed:
+                raise projects_module.subprocess.TimeoutExpired(cmd="powershell.exe", timeout=60)
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = HangingProcess()
+    monkeypatch.setattr(projects_module.subprocess, "Popen", lambda *_args, **_kwargs: process)
+
+    with pytest.raises(HTTPException, match="60 秒") as exc_info:
+        _convert_legacy_excel_with_desktop_excel(b"legacy workbook")
+
+    assert exc_info.value.status_code == 408
+    assert process.killed is True
+    assert process.communicate_calls == 2
 
 
 def test_upload_rejects_non_excel_suffix() -> None:
@@ -391,6 +623,130 @@ def test_uploaded_manual_review_workbook_applies_a_unique_pending_update() -> No
     assert final_data["issues"][0]["status"] == "confirmed"
     assert final_data["issues"][0]["resolution"] == "imported_workbook"
     assert final_data["issues"][0]["resolution_note"] == "已核对异动单"
+
+
+def test_online_manual_review_applies_multiple_explicit_decisions_atomically() -> None:
+    final_data = {
+        "entities": {
+            "employee_profile": [
+                {"工号": "E001", "姓名": "甲", "部门": "旧部门"},
+                {"工号": "E002", "姓名": "乙", "部门": "原部门"},
+            ],
+        },
+        "issues": [
+            {
+                "issue_id": "issue-1",
+                "issue_type": "department_transfer",
+                "employee_id": "E001",
+                "person_name": "甲",
+                "target_field": "部门",
+                "current_value": "旧部门",
+                "status": "pending",
+            },
+            {
+                "issue_id": "issue-2",
+                "issue_type": "department_transfer",
+                "employee_id": "E002",
+                "person_name": "乙",
+                "target_field": "部门",
+                "current_value": "原部门",
+                "status": "pending",
+            },
+        ],
+    }
+
+    applied = _apply_manual_review_decisions(final_data, [
+        {
+            "issue_id": "issue-1",
+            "outcome": "更新到总表",
+            "value": "新部门",
+            "note": "已核对异动单",
+        },
+        {
+            "issue_id": "issue-2",
+            "outcome": "保留总表",
+            "value": None,
+            "note": "无需变更",
+        },
+    ])
+
+    assert applied == 2
+    assert final_data["entities"]["employee_profile"][0]["部门"] == "新部门"
+    assert final_data["entities"]["employee_profile"][1]["部门"] == "原部门"
+    assert [issue["status"] for issue in final_data["issues"]] == ["confirmed", "confirmed"]
+    assert final_data["issues"][0]["resolution"] == "online_review"
+    assert final_data["issues"][1]["resolution"] == "keep_current"
+
+
+def test_manual_issue_ids_are_unique_when_legacy_ids_repeat() -> None:
+    issues = [{"issue_id": "issue-0"}, {"issue_id": "issue-0"}, {}]
+
+    _assign_manual_issue_ids(issues)
+
+    assert [issue["issue_id"] for issue in issues] == ["issue-0", "issue-0-1", "issue-2"]
+
+
+def test_online_manual_review_updates_a_uniquely_named_person_without_employee_id() -> None:
+    final_data = {
+        "entities": {
+            "employee_profile": [{"工号": "E001", "姓名": "甲", "岗位": "药师"}],
+        },
+        "issues": [{
+            "issue_id": "job-change-1",
+            "issue_type": "organizational_change",
+            "person_name": "甲",
+            "target_field": "岗位",
+            "current_value": "药师",
+            "proposed_value": "营业员",
+            "status": "pending",
+        }],
+    }
+
+    applied = _apply_manual_review_decisions(final_data, [{
+        "issue_id": "job-change-1",
+        "outcome": "更新到总表",
+        "value": "营业员",
+        "note": "已确认人员异动",
+    }])
+
+    assert applied == 1
+    assert final_data["entities"]["employee_profile"][0]["岗位"] == "营业员"
+    assert final_data["issues"][0]["status"] == "confirmed"
+
+
+def test_online_manual_review_rejects_invalid_decision_without_partial_update() -> None:
+    final_data = {
+        "entities": {
+            "employee_profile": [{"工号": "E001", "姓名": "甲", "部门": "旧部门"}],
+        },
+        "issues": [{
+            "issue_id": "issue-1",
+            "issue_type": "department_transfer",
+            "employee_id": "E001",
+            "person_name": "甲",
+            "target_field": "部门",
+            "status": "pending",
+        }],
+    }
+
+    with pytest.raises(ValueError, match="当前批次不存在"):
+        _apply_manual_review_decisions(final_data, [
+            {
+                "issue_id": "issue-1",
+                "outcome": "更新到总表",
+                "value": "新部门",
+                "note": "",
+            },
+            {
+                "issue_id": "unknown-issue",
+                "outcome": "保留总表",
+                "value": None,
+                "note": "",
+            },
+        ])
+
+    assert final_data["entities"]["employee_profile"][0]["部门"] == "旧部门"
+    assert final_data["issues"][0]["status"] == "pending"
 
 
 def test_duty_roster_counts_replace_old_master_values(tmp_path) -> None:

@@ -5,7 +5,9 @@ sqlalchemy
 passlib[bcrypt]
 python-jose[cryptography]
 python-multipart
+httpx2
 pydantic[email]
 pandas
+xlrd==2.0.1
 openpyxl
 duckdb

@@ -48,6 +48,7 @@ from core.unified_integration import (
     write_manual_issues_workbook,
     remove_manual_issues_sheet,
 )
+from core.sheet_mapper import apply_semantic_sheet_updates
 from core.diff_engine import compute_diff, apply_confirmed_diff
 from core.validator import DataValidator
 
@@ -58,6 +59,8 @@ BUILTIN_TEMPLATE_PATH = os.path.join(DATA_DIR, "templates", "大药房工资核�
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 PRESERVED_LAYOUT_SHEETS = {"工资核算"}
+_PAYROLL_MASTER_FILE_TYPES = {"template", "financial_master"}
+_PAYROLL_SOURCE_FILE_TYPES = {"source", "financial_source"}
 _EXTERNAL_WORKBOOK_REFERENCE = re.compile(
     r"(?:'[^']*\[[^\]]+\][^']*'|\[[^\]]+\][^!]*?)!"
 )
@@ -107,6 +110,66 @@ def _build_export_preview(
         return {"sheet_name": sheet.title, "rows": rows}
     finally:
         workbook.close()
+
+
+def _manual_location_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def _attach_manual_issue_locations(workbook_path: str, issues: list[dict[str, Any]]) -> None:
+    """Attach a safe Sheet/cell address for editable manual-review items."""
+    if not issues or not os.path.exists(workbook_path):
+        return
+    employee_headers = {"工号", "新工号", "员工工号", "员工编号", "人员编码", "工牌号"}
+    name_headers = {"姓名", "人员姓名", "员工姓名", "名字"}
+    locations: dict[tuple[str, str, str], list[tuple[str, str]]] = {}
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=False)
+    try:
+        for sheet in workbook.worksheets:
+            for header_row in range(1, min(sheet.max_row, 30) + 1):
+                headers = {
+                    column: _manual_location_text(sheet.cell(header_row, column).value)
+                    for column in range(1, sheet.max_column + 1)
+                }
+                id_column = next((column for column, header in headers.items() if header in employee_headers), None)
+                name_column = next((column for column, header in headers.items() if header in name_headers), None)
+                field_columns = {
+                    header: column for column, header in headers.items()
+                    if header and header not in employee_headers and header not in name_headers
+                }
+                if not field_columns or (id_column is None and name_column is None):
+                    continue
+                for row in range(header_row + 1, sheet.max_row + 1):
+                    employee_id = _manual_location_text(sheet.cell(row, id_column).value) if id_column else ""
+                    person_name = _manual_location_text(sheet.cell(row, name_column).value) if name_column else ""
+                    if not employee_id and not person_name:
+                        continue
+                    for field, column in field_columns.items():
+                        # Read-only worksheets represent an empty cell as an
+                        # EmptyCell without a coordinate.  The target address
+                        # is defined by the row and column we already know.
+                        coordinate = f"{openpyxl.utils.get_column_letter(column)}{row}"
+                        if employee_id:
+                            locations.setdefault(("employee", employee_id, field), []).append((sheet.title, coordinate))
+                        if person_name:
+                            locations.setdefault(("name", person_name, field), []).append((sheet.title, coordinate))
+    finally:
+        workbook.close()
+
+    for issue in issues:
+        field = _manual_location_text(issue.get("target_field"))
+        employee_id = _manual_location_text(issue.get("employee_id"))
+        person_name = _manual_location_text(issue.get("person_name"))
+        candidates = locations.get(("employee", employee_id, field), []) if employee_id else []
+        if not candidates and person_name and person_name != "全表":
+            candidates = locations.get(("name", person_name, field), [])
+        if len(candidates) == 1:
+            sheet_name, cell = candidates[0]
+            issue["target_sheet"] = sheet_name
+            issue["target_cell"] = cell
+            issue["target_location"] = f"{sheet_name}!{cell}"
+        else:
+            issue["target_location"] = "未能自动定位"
 
 
 def _normalize_export_filename(filename: str) -> str:
@@ -483,6 +546,52 @@ def _copy_novel_source_sheets(
     return {"copied_sheets": copied_sheets, "mapped_sheets": mapped_sheets}
 
 
+def _apply_semantic_source_updates(
+    output_path: str,
+    source_paths: list[str],
+    salary_month: str | None = None,
+    source_names: dict[str, str] | None = None,
+    sheet_overrides: dict[tuple[str, str], str] | None = None,
+) -> dict[str, Any]:
+    """Apply every uniquely understood source Sheet without adding new Sheets."""
+    return apply_semantic_sheet_updates(
+        output_path, source_paths, output_path,
+        salary_month=salary_month,
+        source_names=source_names,
+        sheet_overrides=sheet_overrides,
+    )
+
+
+_SEMANTIC_REVIEW_ISSUE_TYPES = {
+    "empty_source_sheet",
+    "unprofiled_source_sheet",
+    "ambiguous_sheet",
+    "unmatched_sheet",
+    "insufficient_topic_evidence",
+    "missing_business_key",
+    "source_formula_conflict",
+    "formula_target_conflict",
+    "duplicate_source_record",
+    "ambiguous_record",
+    "unknown_record",
+    "conflicting_value",
+}
+
+
+def _semantic_issue_key(issue: dict[str, Any]) -> str:
+    """Identify a source-workbook task even after the output workbook is regenerated."""
+    identifying_fields = {
+        field: issue.get(field)
+        for field in (
+            "issue_type", "source_files", "source_sheets", "source_row", "source_rows",
+            "source_cell", "target_sheet", "target_cell", "business_key", "candidate_values",
+        )
+        if issue.get(field) not in (None, "", [], {})
+    }
+    encoded = json.dumps(identifying_fields, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _freeze_external_workbook_formulas(
     output_path: str,
     fallback_source_paths: str | list[str] | None = None,
@@ -853,8 +962,18 @@ def _standard_manual_follow_up_issues(master_filename: str) -> list[dict[str, An
 
 
 def _assign_manual_issue_ids(issues: list[dict[str, Any]]) -> None:
+    seen: set[str] = set()
     for index, issue in enumerate(issues):
-        issue.setdefault("issue_id", f"issue-{index}")
+        base = str(issue.get("issue_id") or f"issue-{index}").strip() or f"issue-{index}"
+        issue_id = base
+        if issue_id in seen:
+            issue_id = f"{base}-{index}"
+            suffix = 2
+            while issue_id in seen:
+                issue_id = f"{base}-{index}-{suffix}"
+                suffix += 1
+        issue["issue_id"] = issue_id
+        seen.add(issue_id)
         issue.setdefault("status", "pending")
 
 
@@ -1003,8 +1122,9 @@ def _manual_review_value(value: Any, issue: dict[str, Any]) -> Any:
 def _manual_review_target_record(final_data: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
     field = str(issue.get("target_field") or "").strip()
     employee_id = str(issue.get("employee_id") or "").strip()
-    if not employee_id:
-        raise ValueError(f"事项 {issue.get('issue_id')} 缺少唯一工号，不能回写总表")
+    person_name = str(issue.get("person_name") or "").strip()
+    if not employee_id and (not person_name or person_name == "全表"):
+        raise ValueError(f"事项 {issue.get('issue_id')} 缺少可唯一定位的人员，不能回写总表")
     if not field or field in _MANUAL_REVIEW_FORBIDDEN_FIELDS:
         raise ValueError(f"事项 {issue.get('issue_id')} 的目标字段不能安全回写")
 
@@ -1013,7 +1133,11 @@ def _manual_review_target_record(final_data: dict[str, Any], issue: dict[str, An
         if not isinstance(records, list):
             continue
         for record in records:
-            if str(record.get("工号") or "").strip() != employee_id:
+            record_employee_id = str(record.get("工号") or "").strip()
+            record_name = str(record.get("姓名") or "").strip()
+            if employee_id and record_employee_id != employee_id:
+                continue
+            if not employee_id and record_name != person_name:
                 continue
             if field in record or (entity_name == "employee_profile" and field in _GUIDED_RESOLUTION_FIELDS):
                 matches.append(record)
@@ -1022,6 +1146,65 @@ def _manual_review_target_record(final_data: dict[str, Any], issue: dict[str, An
             f"事项 {issue.get('issue_id')} 无法唯一定位“{field}”的总表数据，不能自动回写"
         )
     return matches[0]
+
+
+def _can_update_manual_issue_online(final_data: dict[str, Any], issue: dict[str, Any]) -> bool:
+    """Expose only items the same write path can uniquely and safely update."""
+    try:
+        _manual_review_target_record(final_data, issue)
+    except ValueError:
+        return False
+    return True
+
+
+def _apply_manual_review_decisions(
+    final_data: dict[str, Any],
+    decisions: list[dict[str, Any]],
+    resolution: str = "online_review",
+) -> int:
+    """Validate every decision before applying the batch to the final data."""
+    _assign_manual_issue_ids(final_data.get("issues", []))
+    issues_by_id = {
+        str(issue.get("issue_id")): issue
+        for issue in final_data.get("issues", [])
+    }
+    prepared: list[tuple[dict[str, Any], str, dict[str, Any] | None, Any, str]] = []
+    seen_issue_ids: set[str] = set()
+
+    for decision in decisions:
+        issue_id = str(decision.get("issue_id") or "").strip()
+        outcome = str(decision.get("outcome") or "待处理").strip()
+        note = str(decision.get("note") or "").strip()
+        if not issue_id:
+            raise ValueError("人工处理事项缺少编号")
+        if issue_id in seen_issue_ids:
+            raise ValueError(f"人工处理事项重复填写：{issue_id}")
+        seen_issue_ids.add(issue_id)
+        if outcome not in MANUAL_REVIEW_OUTCOMES:
+            raise ValueError(f"事项 {issue_id} 的处理结果无效")
+        issue = issues_by_id.get(issue_id)
+        if issue is None:
+            raise ValueError(f"人工处理事项包含当前批次不存在的事项：{issue_id}")
+        if issue.get("status") == "confirmed":
+            continue
+
+        target_record: dict[str, Any] | None = None
+        value: Any = None
+        if outcome == "更新到总表":
+            target_record = _manual_review_target_record(final_data, issue)
+            value = _manual_review_value(decision.get("value"), issue)
+        prepared.append((issue, outcome, target_record, value, note))
+
+    for issue, outcome, target_record, value, note in prepared:
+        if outcome == "更新到总表":
+            assert target_record is not None
+            target_record[str(issue["target_field"]).strip()] = value
+            issue["resolution"] = resolution
+        else:
+            issue["resolution"] = "keep_current"
+        issue["status"] = "confirmed"
+        issue["resolution_note"] = note
+    return len(prepared)
 
 
 def _apply_manual_review_workbook(final_data: dict[str, Any], content: bytes) -> int:
@@ -1053,27 +1236,19 @@ def _apply_manual_review_workbook(final_data: dict[str, Any], content: bytes) ->
     finally:
         workbook.close()
 
-    _assign_manual_issue_ids(final_data.get("issues", []))
-    issues_by_id = {str(issue.get("issue_id")): issue for issue in final_data.get("issues", [])}
-    unknown_ids = set(issue_rows) - set(issues_by_id)
-    if unknown_ids:
-        raise ValueError(f"人工处理表包含当前批次不存在的事项：{'、'.join(sorted(unknown_ids))}")
-
-    applied = 0
-    for issue_id, (outcome, value, note) in issue_rows.items():
-        issue = issues_by_id[issue_id]
-        if issue.get("status") == "confirmed":
-            continue
-        if outcome == "更新到总表":
-            record = _manual_review_target_record(final_data, issue)
-            record[str(issue["target_field"]).strip()] = _manual_review_value(value, issue)
-            issue["resolution"] = "imported_workbook"
-        else:
-            issue["resolution"] = "keep_current"
-        issue["status"] = "confirmed"
-        issue["resolution_note"] = note
-        applied += 1
-    return applied
+    return _apply_manual_review_decisions(
+        final_data,
+        [
+            {
+                "issue_id": issue_id,
+                "outcome": outcome,
+                "value": value,
+                "note": note,
+            }
+            for issue_id, (outcome, value, note) in issue_rows.items()
+        ],
+        resolution="imported_workbook",
+    )
 
 
 def _record_identity_tokens(record: dict[str, Any]) -> set[tuple[str, str]]:
@@ -1162,7 +1337,7 @@ def _select_template_file(project_id: str, db: Session) -> tuple[UploadFile | No
     explicit_masters = [
         (file, path)
         for file, path in existing
-        if str(getattr(file, "file_type", "")) == "template"
+        if str(getattr(file, "file_type", "")) in _PAYROLL_MASTER_FILE_TYPES
         and _supports_unified_export(path)
     ]
     return explicit_masters[0] if len(explicit_masters) == 1 else None
@@ -1189,12 +1364,76 @@ def _session_path(project_id: str, suffix: str) -> str:
     return os.path.join(SESSION_DIR, f"{project_id}_{suffix}.json")
 
 
+def _manual_sheet_overrides(final_data: dict[str, Any]) -> dict[tuple[str, str], str]:
+    """Return the user's explicit source-Sheet-to-master-Sheet choices."""
+    overrides: dict[tuple[str, str], str] = {}
+    for item in final_data.get("sheet_mappings", []):
+        if not isinstance(item, dict):
+            continue
+        source_file = str(item.get("source_file") or "").strip()
+        source_sheet = str(item.get("source_sheet") or "").strip()
+        target_sheet = str(item.get("target_sheet") or "").strip()
+        if source_file and source_sheet and target_sheet:
+            overrides[(source_file, source_sheet)] = target_sheet
+    return overrides
+
+
+def _workbook_sheet_names(workbook_path: str) -> list[str]:
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=False)
+    try:
+        return list(workbook.sheetnames)
+    finally:
+        workbook.close()
+
+
+_INTEGRATION_PROGRESS_STAGES = (
+    ("base", "加载原始数据库"),
+    ("source", "解析来源文件"),
+    ("match", "构建完整人员并集"),
+    ("export", "生成可下载 Excel"),
+)
+
+
+def _default_integration_progress_stages() -> list[dict[str, str]]:
+    return [
+        {"key": key, "label": label, "status": "pending"}
+        for key, label in _INTEGRATION_PROGRESS_STAGES
+    ]
+
+
+def _save_integration_progress(
+    project_id: str,
+    *,
+    status: str,
+    stages: list[dict[str, Any]],
+    detail: str | None = None,
+) -> dict[str, Any]:
+    """Persist live stage state without putting it in export-result metadata."""
+    progress = {
+        "status": status,
+        "stages": stages,
+        "detail": detail,
+        "updated_at": datetime.now().isoformat(),
+    }
+    _save_json(project_id, "integration_progress", progress)
+    return progress
+
+
+def _load_integration_progress(project_id: str) -> dict[str, Any]:
+    return _load_json(project_id, "integration_progress") or {
+        "status": "idle",
+        "stages": _default_integration_progress_stages(),
+        "detail": None,
+        "updated_at": "",
+    }
+
+
 def _project_source_signature(files: list[Any]) -> str:
     """Build a stable fingerprint for every workbook that affects an export."""
     records = []
     for file in files:
         file_type = str(getattr(file, "file_type", ""))
-        if file_type not in {"template", "source"}:
+        if file_type not in _PAYROLL_MASTER_FILE_TYPES | _PAYROLL_SOURCE_FILE_TYPES:
             continue
         created_at = getattr(file, "created_at", None)
         records.append({
@@ -1218,7 +1457,7 @@ def _project_source_signature(files: list[Any]) -> str:
 def _current_source_signature(project_id: str, db: Session) -> tuple[str, int]:
     files = db.query(UploadFile).filter(
         UploadFile.project_id == project_id,
-        UploadFile.file_type.in_(["template", "source"]),
+        UploadFile.file_type.in_([*_PAYROLL_MASTER_FILE_TYPES, *_PAYROLL_SOURCE_FILE_TYPES]),
     ).all()
     return _project_source_signature(files), len(files)
 
@@ -1262,7 +1501,7 @@ def _ensure_manual_issues_export(project_id: str, meta: dict[str, Any]) -> tuple
     return filename, absolute_path
 
 
-_REVIEW_EXPORT_FORMAT_VERSION = 3
+_REVIEW_EXPORT_FORMAT_VERSION = 4
 
 
 def _ensure_review_export(
@@ -1836,6 +2075,7 @@ class ExportResult(BaseModel):
     review_filename: str | None = None
     duration_seconds: float = 0
     stage_durations: dict[str, float] = Field(default_factory=dict)
+    target_sheets: list[str] = Field(default_factory=list)
 
 
 class ExportRenameIn(BaseModel):
@@ -1862,6 +2102,94 @@ class IntegrationResult(BaseModel):
     review_filename: str | None = None
     duration_seconds: float = 0
     stage_durations: dict[str, float] = Field(default_factory=dict)
+
+
+class IntegrationProgress(BaseModel):
+    status: str
+    stages: list[dict[str, Any]] = Field(default_factory=list)
+    detail: str | None = None
+    updated_at: str = ""
+
+
+class MatchingSourceRuleIn(BaseModel):
+    """A scoped source-sheet/target-field hint for one project period."""
+
+    company: str | None = Field(default=None, max_length=200)
+    month: str | None = Field(default=None, max_length=20)
+    source_sheet: str | None = Field(default=None, max_length=120)
+    target_sheet: str | None = Field(default=None, max_length=120)
+    target_field: str | None = Field(default=None, max_length=120)
+    action: str = Field(default="review", pattern="^(allow|review|ignore)$")
+
+
+class MatchingPolicyIn(BaseModel):
+    """Safe, tenant-isolated matching controls; no database schema change."""
+
+    auto_match_threshold: float = Field(default=0.85, ge=0.85, le=0.99)
+    field_weights: dict[str, float] = Field(default_factory=lambda: {
+        "姓名": 0.50,
+        "公司": 0.25,
+        "部门": 0.15,
+        "岗位": 0.10,
+    })
+    source_rules: list[MatchingSourceRuleIn] = Field(default_factory=list, max_length=200)
+
+
+class MatchingPolicyOut(MatchingPolicyIn):
+    project_id: str
+    company: str
+    salary_month: str
+    updated_at: str
+
+
+def _default_matching_policy(project: Project) -> dict[str, Any]:
+    return {
+        "project_id": str(project.id),
+        "company": str(project.name),
+        "salary_month": str(project.salary_month),
+        "auto_match_threshold": 0.85,
+        "field_weights": {"姓名": 0.50, "公司": 0.25, "部门": 0.15, "岗位": 0.10},
+        "source_rules": [],
+        "updated_at": "",
+    }
+
+
+@router.get("/{project_id}/matching-policy", response_model=MatchingPolicyOut)
+def get_matching_policy(project_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    project = _load_project_or_404(project_id, user, db)
+    policy = _load_json(project.id, "matching_policy") or _default_matching_policy(project)
+    policy["project_id"] = str(project.id)
+    policy["company"] = str(project.name)
+    policy["salary_month"] = str(project.salary_month)
+    return MatchingPolicyOut.model_validate(policy)
+
+
+@router.put("/{project_id}/matching-policy", response_model=MatchingPolicyOut)
+def update_matching_policy(
+    project_id: str,
+    payload: MatchingPolicyIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    project = _load_project_or_404(project_id, user, db)
+    allowed_fields = {"姓名", "公司", "部门", "岗位"}
+    unknown_fields = set(payload.field_weights) - allowed_fields
+    if unknown_fields:
+        raise HTTPException(status_code=422, detail=f"不支持的匹配字段：{'、'.join(sorted(unknown_fields))}")
+    if any(value < 0 for value in payload.field_weights.values()):
+        raise HTTPException(status_code=422, detail="匹配字段权重不能为负数")
+    total = sum(payload.field_weights.values())
+    if total <= 0:
+        raise HTTPException(status_code=422, detail="至少需要一个大于 0 的匹配字段权重")
+    policy = {
+        **payload.model_dump(),
+        "project_id": str(project.id),
+        "company": str(project.name),
+        "salary_month": str(project.salary_month),
+        "updated_at": datetime.now().isoformat(),
+    }
+    _save_json(project.id, "matching_policy", policy)
+    return MatchingPolicyOut.model_validate(policy)
 
 
 def _load_template_base_entities(
@@ -1904,13 +2232,17 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
     integration_started = time.perf_counter()
     p = _load_project_or_404(project_id, user, db)
     _save_json(p.id, "export_meta", {"status": "processing"})
-    stages: list[dict[str, Any]] = []
+    stages = _default_integration_progress_stages()
+    _save_integration_progress(p.id, status="processing", stages=stages, detail="等待开始")
     logs: list[str] = []
     stage_durations: dict[str, float] = {}
 
     stage_started = time.perf_counter()
+    stages[0]["status"] = "running"
+    _save_integration_progress(p.id, status="processing", stages=stages, detail=stages[0]["label"])
     selected_template = _select_template_file(p.id, db)
     if not selected_template:
+        _save_integration_progress(p.id, status="blocked", stages=stages, detail="缺少可用总表底板")
         raise HTTPException(status_code=400, detail="请先在“总表”上传区上传且仅上传一份包含“工资核算”Sheet 的总表")
     template_file, template_path = selected_template
     effective_salary_month = _resolve_effective_salary_month(
@@ -1920,7 +2252,8 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
     base_entities, template_logs = _load_template_base_entities(template_file, template_path)
     stage_durations["base"] = round(time.perf_counter() - stage_started, 2)
     logs.extend(template_logs)
-    stages.append({"key": "base", "label": "加载原始数据库", "status": "completed"})
+    stages[0]["status"] = "completed"
+    _save_integration_progress(p.id, status="processing", stages=stages, detail="已加载总表底板")
     logs.append(
         f"自动选择总表底板：{template_file.original_name if template_file else os.path.basename(template_path)}"
     )
@@ -1928,9 +2261,11 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
     source_entities: dict[str, list[dict]] = {}
     failed_source_files: list[str] = []
     stage_started = time.perf_counter()
+    stages[1]["status"] = "running"
+    _save_integration_progress(p.id, status="processing", stages=stages, detail=stages[1]["label"])
     source_query = db.query(UploadFile).filter(
         UploadFile.project_id == p.id,
-        UploadFile.file_type == "source",
+        UploadFile.file_type.in_([*_PAYROLL_SOURCE_FILE_TYPES]),
     )
     source_files = source_query.order_by(UploadFile.created_at.asc()).all()
     for source_file in source_files:
@@ -1970,7 +2305,8 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
             logs.append(f"解析失败：{source_file.original_name}：{exc}")
             failed_source_files.append(source_file.original_name)
     stage_durations["source"] = round(time.perf_counter() - stage_started, 2)
-    stages.append({"key": "source", "label": "解析来源文件", "status": "completed"})
+    stages[1]["status"] = "completed"
+    _save_integration_progress(p.id, status="processing", stages=stages, detail="已完成来源文件解析")
     logs.append(f"参与人员汇总的其他文件：{len(source_files)} 个")
     if failed_source_files:
         detail = "、".join(failed_source_files[:5])
@@ -1981,21 +2317,27 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
             "export_meta",
             {"status": "blocked", "detail": f"以下变更文件解析失败：{detail}"},
         )
+        _save_integration_progress(p.id, status="blocked", stages=stages, detail=f"以下变更文件解析失败：{detail}")
         raise HTTPException(
             status_code=400,
             detail=f"以下变更文件解析失败，已停止更新以避免漏人：{detail}",
         )
 
     stage_started = time.perf_counter()
+    stages[2]["status"] = "running"
+    _save_integration_progress(p.id, status="processing", stages=stages, detail=stages[2]["label"])
+    matching_policy = _load_json(p.id, "matching_policy") or _default_matching_policy(p)
     prepared = combine_entity_sources(
         base_entities,
         source_entities,
         salary_month=effective_salary_month,
+        matching_policy=matching_policy,
     )
     try:
         _ensure_recognized_people(prepared)
     except HTTPException as exc:
         _save_json(p.id, "export_meta", {"status": "blocked", "detail": exc.detail})
+        _save_integration_progress(p.id, status="blocked", stages=stages, detail=str(exc.detail))
         raise
     final_entities = prepared["entities"]
     validation = _validate_final_entities(final_entities)
@@ -2019,6 +2361,7 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
         "template_file_id": template_file.id if template_file else None,
         "template_name": template_file.original_name if template_file else os.path.basename(template_path),
         "salary_month": effective_salary_month,
+        "matching_policy": matching_policy,
         "source_signature": source_signature,
         "created_at": datetime.now().isoformat(),
     }
@@ -2028,8 +2371,9 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
         "imported_at": datetime.now().isoformat(),
         "logs": logs,
     })
-    stages.append({"key": "match", "label": "构建完整人员并集", "status": "completed"})
+    stages[2]["status"] = "completed"
     stage_durations["match"] = round(time.perf_counter() - stage_started, 2)
+    _save_integration_progress(p.id, status="processing", stages=stages, detail="已完成人员匹配与校验")
     logs.append(
         f"人员覆盖校验：输入候选 {prepared['input_person_count']} 人，"
         f"自动写入 {prepared['output_person_count']} 人，"
@@ -2037,12 +2381,28 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
     )
 
     stage_started = time.perf_counter()
-    exported = export_pipeline(project_id, user=user, db=db)
+    stages[3]["status"] = "running"
+    _save_integration_progress(p.id, status="processing", stages=stages, detail=stages[3]["label"])
+    try:
+        exported = export_pipeline(project_id, user=user, db=db)
+    except HTTPException as exc:
+        _save_integration_progress(p.id, status="failed", stages=stages, detail=str(exc.detail))
+        raise
+    except Exception:
+        _save_integration_progress(p.id, status="failed", stages=stages, detail="生成 Excel 时发生错误")
+        raise
     stage_durations["export"] = round(time.perf_counter() - stage_started, 2)
-    stages.append({"key": "export", "label": "生成可下载 Excel", "status": "completed"})
+    stages[3]["status"] = "completed"
     logs.extend(exported.log)
+    completed_status = "completed_with_issues" if exported.issue_count else "completed"
+    _save_integration_progress(
+        p.id,
+        status=completed_status,
+        stages=stages,
+        detail="已生成最新成果，可在成果页查收",
+    )
     return IntegrationResult(
-        status="completed_with_issues" if exported.issue_count else "completed",
+        status=completed_status,
         filename=exported.filename,
         stages=stages,
         overview=get_entity_overview(final_entities),
@@ -2062,6 +2422,17 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
         duration_seconds=round(time.perf_counter() - integration_started, 2),
         stage_durations=stage_durations,
     )
+
+
+@router.get("/{project_id}/integrate/progress", response_model=IntegrationProgress)
+def get_integration_progress(
+    project_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return live integration progress for an authorized project."""
+    project = _load_project_or_404(project_id, user, db)
+    return IntegrationProgress(**_load_integration_progress(project.id))
 
 
 @router.post("/{project_id}/export", response_model=ExportResult)
@@ -2127,7 +2498,7 @@ def export_pipeline(project_id: str, user: User = Depends(get_current_user),
         source_names: dict[str, str] = {}
         for file in db.query(UploadFile).filter(
             UploadFile.project_id == p.id,
-            UploadFile.file_type == "source",
+            UploadFile.file_type.in_([*_PAYROLL_SOURCE_FILE_TYPES]),
         ).order_by(UploadFile.created_at.asc()).all():
             path = os.path.join(UPLOAD_DIR, file.stored_path)
             if not os.path.exists(path):
@@ -2137,10 +2508,22 @@ def export_pipeline(project_id: str, user: User = Depends(get_current_user),
                 continue
             source_paths.append(path)
             source_names[path] = file.original_name
-        # Source workbooks are inputs. Recognized business sheets update their
-        # canonical master sheet; only genuinely new business sheets are kept.
-        sheet_decisions = _copy_novel_source_sheets(out_path, source_paths, source_names)
-        copied_sheets = sheet_decisions["copied_sheets"]
+        # Every source Sheet is compared to every existing master Sheet. An
+        # unmatched Sheet is an auditable manual exception, never a new tab.
+        sheet_decisions = _apply_semantic_source_updates(
+            out_path,
+            source_paths,
+            salary_month=str(final_data.get("salary_month") or export_month),
+            source_names=source_names,
+            sheet_overrides=_manual_sheet_overrides(final_data),
+        )
+        ignored_semantic_issues = set(final_data.get("ignored_semantic_issue_keys", []))
+        result["issues"].extend(
+            issue for issue in sheet_decisions["issues"]
+            if _semantic_issue_key(issue) not in ignored_semantic_issues
+        )
+        _assign_manual_issue_ids(result["issues"])
+        result["issue_count"] = len(result["issues"])
         formula_count = None
         if _payroll_person_count(template_path) == result["output_person_count"]:
             # Validate the master formulas before the intentional external-link
@@ -2163,6 +2546,7 @@ def export_pipeline(project_id: str, user: User = Depends(get_current_user),
             final_data["entities"],
         )
         remove_manual_issues_sheet(out_path)
+        _attach_manual_issue_locations(out_path, result["issues"])
         write_manual_issues_workbook(issues_path, result["issues"])
         if template_path != uploaded_template_path:
             result["log"].append(f"输出格式底板：{os.path.basename(template_path)}")
@@ -2173,7 +2557,9 @@ def export_pipeline(project_id: str, user: User = Depends(get_current_user),
             issues=result["issues"],
         )
         result["log"].append(
-            f"来源 Sheet 语义归并：{len(sheet_decisions['mapped_sheets'])} 个，真正新增：{len(copied_sheets)} 个"
+            f"来源 Sheet 语义归并：{len(sheet_decisions['matches'])} 个，"
+            f"自动覆盖 {sheet_decisions['auto_update_count']} 个单元格，"
+            f"复杂异常 {len(sheet_decisions['issues'])} 项"
         )
         result["log"].append(
             f"已生成修改稿：标记 {review_summary['change_count']} 项更新内容"
@@ -2206,6 +2592,7 @@ def export_pipeline(project_id: str, user: User = Depends(get_current_user),
         "review_format_version": _REVIEW_EXPORT_FORMAT_VERSION,
         "duration_seconds": round(time.perf_counter() - export_started, 2),
         "stage_durations": final_data.get("stage_durations", {}),
+        "target_sheets": _workbook_sheet_names(out_path),
     }
     export_meta["source_signature"], uploaded_file_count = _current_source_signature(p.id, db)
     # The selected master is a baseline, not a source/change workbook.
@@ -2241,6 +2628,31 @@ class ManualIssueResolveIn(BaseModel):
     action: str = Field(pattern="^(apply_proposed|keep_current)$")
 
 
+class ManualReviewDecisionIn(BaseModel):
+    issue_id: str = Field(min_length=1, max_length=120)
+    outcome: str = Field(pattern="^(更新到总表|保留总表)$")
+    value: str | int | float | bool | None = None
+    note: str = Field(default="", max_length=1000)
+    remember: bool = False
+
+
+class ManualReviewApplyIn(BaseModel):
+    decisions: list[ManualReviewDecisionIn] = Field(min_length=1, max_length=1000)
+
+
+class ManualSheetMappingIn(BaseModel):
+    issue_id: str = Field(min_length=1, max_length=120)
+    target_sheet: str = Field(min_length=1, max_length=120)
+
+
+class ManualSheetMappingsIn(BaseModel):
+    mappings: list[ManualSheetMappingIn] = Field(min_length=1, max_length=500)
+
+
+class ManualSemanticIssueIgnoreIn(BaseModel):
+    issue_id: str = Field(min_length=1, max_length=120)
+
+
 @router.post(
     "/{project_id}/manual-review/import",
     response_model=ExportResult,
@@ -2272,6 +2684,188 @@ def import_manual_review_workbook(
     _save_json(p.id, "final_db", final_data)
     result = export_pipeline(project_id, user=user, db=db)
     result.log.insert(0, f"已导入人工处理表并更新 {updated} 项；未处理事项保留在最新清单中")
+    return result
+
+
+@router.post(
+    "/{project_id}/manual-review/apply",
+    response_model=ExportResult,
+)
+def apply_online_manual_review(
+    project_id: str,
+    payload: ManualReviewApplyIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Apply webpage decisions in one validated batch and regenerate exports."""
+    p = _load_project_or_404(project_id, user, db)
+    final_data = _load_json(p.id, "final_db")
+    if not final_data:
+        raise HTTPException(status_code=400, detail="请先完成数据整合")
+    decisions = [decision.model_dump() for decision in payload.decisions]
+    try:
+        updated = _apply_manual_review_decisions(
+            final_data,
+            decisions,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=400, detail="所选事项已处理或没有可更新内容")
+
+    _save_json(p.id, "final_db", final_data)
+    result = export_pipeline(project_id, user=user, db=db)
+    result.log.insert(0, f"已在网页完成 {updated} 项人工处理，并生成最新总表")
+    remembered = 0
+    issues_by_id = {str(issue.get("issue_id")): issue for issue in final_data.get("issues", [])}
+    for decision in decisions:
+        if not decision.get("remember"):
+            continue
+        issue = issues_by_id.get(str(decision.get("issue_id")))
+        if not issue:
+            continue
+        try:
+            memory_item = dict(issue)
+            memory_item["source_sheet"] = (issue.get("source_sheets") or [None])[0]
+            experience_store.record_agent_decision(
+                tenant_id=str(user.tenant_id),
+                project_id=str(p.id),
+                created_by=str(user.id),
+                diff_type=str(issue.get("issue_type") or "manual_review"),
+                item=memory_item,
+                match_fields=["issue_type", "target_field", "source_sheet"],
+                decision=str(decision.get("outcome") or ""),
+                updates={str(issue.get("target_field") or ""): decision.get("value")},
+                note=str(decision.get("note") or ""),
+                period_key=str(final_data.get("salary_month") or p.salary_month),
+                confidence=1.0,
+            )
+            remembered += 1
+        except ValueError:
+            continue
+    if remembered:
+        result.log.insert(1, f"已将 {remembered} 项确认沉淀为本公司候选经验规则")
+    return result
+
+
+def _save_manual_sheet_mappings(
+    project_id: str,
+    mappings: list[ManualSheetMappingIn],
+    user: User,
+    db: Session,
+) -> tuple[Project, dict[str, Any], int]:
+    """Validate and persist Sheet choices together before regenerating exports."""
+    p = _load_project_or_404(project_id, user, db)
+    final_data = _load_json(p.id, "final_db")
+    if not final_data:
+        raise HTTPException(status_code=400, detail="请先完成数据整合")
+    meta = _load_current_export_meta(p.id, db)
+    _assign_manual_issue_ids(meta.get("issues", []))
+    selected_template = _resolve_export_template(p.id, final_data.get("template_file_id"), db)
+    if not selected_template:
+        raise HTTPException(status_code=400, detail="找不到当前总表，无法确认目标工作表")
+    _, template_path = selected_template
+    target_sheets = _workbook_sheet_names(_resolve_layout_template_path(template_path))
+    issues_by_id = {str(item.get("issue_id")): item for item in meta.get("issues", [])}
+    seen_sources: set[tuple[str, str]] = set()
+    validated: list[tuple[str, str, str]] = []
+    for mapping in mappings:
+        issue = issues_by_id.get(mapping.issue_id.strip())
+        if not issue:
+            raise HTTPException(status_code=404, detail="有待确认任务已不存在，请刷新页面")
+        if str(issue.get("issue_type") or "") not in {
+            "ambiguous_sheet", "unmatched_sheet", "insufficient_topic_evidence",
+        }:
+            raise HTTPException(status_code=400, detail="所选任务不需要选择目标工作表")
+        source_files = issue.get("source_files") or []
+        source_sheets = issue.get("source_sheets") or []
+        if len(source_files) != 1 or len(source_sheets) != 1:
+            raise HTTPException(status_code=400, detail="有任务缺少唯一来源，不能安全保存映射")
+        if mapping.target_sheet not in target_sheets:
+            raise HTTPException(status_code=400, detail=f"所选目标工作表“{mapping.target_sheet}”不在当前总表中")
+        source_file, source_sheet = str(source_files[0]), str(source_sheets[0])
+        if (source_file, source_sheet) in seen_sources:
+            raise HTTPException(status_code=400, detail="同一来源工作表不能重复选择")
+        seen_sources.add((source_file, source_sheet))
+        validated.append((source_file, source_sheet, mapping.target_sheet))
+
+    remaining_mappings = [
+        mapping for mapping in final_data.get("sheet_mappings", [])
+        if isinstance(mapping, dict)
+        and (str(mapping.get("source_file") or ""), str(mapping.get("source_sheet") or "")) not in seen_sources
+    ]
+    remaining_mappings.extend({"source_file": source_file, "source_sheet": source_sheet, "target_sheet": target_sheet}
+                              for source_file, source_sheet, target_sheet in validated)
+    final_data["sheet_mappings"] = remaining_mappings
+    _save_json(p.id, "final_db", final_data)
+    return p, final_data, len(validated)
+
+
+@router.post(
+    "/{project_id}/manual-review/sheet-mappings",
+    response_model=ExportResult,
+)
+def apply_manual_sheet_mapping(
+    project_id: str,
+    payload: ManualSheetMappingIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist one Sheet destination choice and regenerate the workbook."""
+    p, _, updated = _save_manual_sheet_mappings(project_id, [payload], user, db)
+    result = export_pipeline(project_id, user=user, db=db)
+    result.log.insert(0, f"已确认 1 个工作表更新位置，并生成最新总表")
+    return result
+
+
+@router.post(
+    "/{project_id}/manual-review/sheet-mappings/batch",
+    response_model=ExportResult,
+)
+def apply_manual_sheet_mappings(
+    project_id: str,
+    payload: ManualSheetMappingsIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persist all checked Sheet destination choices in one export operation."""
+    p, _, updated = _save_manual_sheet_mappings(project_id, payload.mappings, user, db)
+    result = export_pipeline(project_id, user=user, db=db)
+    result.log.insert(0, f"已批量确认 {updated} 个工作表更新位置，并生成最新总表")
+    return result
+
+
+@router.post(
+    "/{project_id}/manual-review/semantic-issues/ignore",
+    response_model=ExportResult,
+)
+def ignore_semantic_manual_issue(
+    project_id: str,
+    payload: ManualSemanticIssueIgnoreIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mark a source-workbook task as intentionally excluded for this batch."""
+    p = _load_project_or_404(project_id, user, db)
+    final_data = _load_json(p.id, "final_db")
+    if not final_data:
+        raise HTTPException(status_code=400, detail="请先完成数据整合")
+    meta = _load_current_export_meta(p.id, db)
+    _assign_manual_issue_ids(meta.get("issues", []))
+    issue = next(
+        (item for item in meta.get("issues", []) if str(item.get("issue_id")) == payload.issue_id.strip()),
+        None,
+    )
+    if not issue:
+        raise HTTPException(status_code=404, detail="该待确认任务已不存在，请刷新页面")
+    if str(issue.get("issue_type") or "") not in _SEMANTIC_REVIEW_ISSUE_TYPES:
+        raise HTTPException(status_code=400, detail="该任务不能通过“本次不更新”处理")
+    ignored = set(final_data.get("ignored_semantic_issue_keys", []))
+    ignored.add(_semantic_issue_key(issue))
+    final_data["ignored_semantic_issue_keys"] = sorted(ignored)
+    _save_json(p.id, "final_db", final_data)
+    result = export_pipeline(project_id, user=user, db=db)
+    result.log.insert(0, "已标记 1 项为本次不更新，并生成最新总表")
     return result
 
 
@@ -2340,10 +2934,15 @@ def get_latest_pipeline_export(project_id: str, user: User = Depends(get_current
     _hydrate_legacy_department_transfer_issues(final_data)
     current_issues = meta.get("issues", final_data.get("issues", []))
     _assign_manual_issue_ids(current_issues)
-    visible_issues = [issue for issue in current_issues if issue.get("status") != "confirmed"]
     export_path = os.path.join(EXPORT_DIR, meta.get("path", ""))
     if not os.path.exists(export_path):
         raise HTTPException(status_code=404, detail="导出文件已丢失")
+    # Location data is attached while generating the export.  Re-scanning a
+    # large workbook here makes this lightweight result query exceed the
+    # frontend request timeout even though the export already exists.
+    for issue in current_issues:
+        issue["can_update_online"] = _can_update_manual_issue_online(final_data, issue)
+    visible_issues = [issue for issue in current_issues if issue.get("status") != "confirmed"]
     issues_filename, _ = _ensure_manual_issues_export(p.id, meta)
     return ExportResult(
         filename=meta["filename"],
@@ -2362,6 +2961,7 @@ def get_latest_pipeline_export(project_id: str, user: User = Depends(get_current
         review_filename=meta.get("review_filename"),
         duration_seconds=float(meta.get("duration_seconds", 0) or 0),
         stage_durations=meta.get("stage_durations", {}),
+        target_sheets=list(meta.get("target_sheets", [])),
     )
 
 

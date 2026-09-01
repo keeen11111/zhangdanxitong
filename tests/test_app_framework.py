@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from backend.config import DEFAULT_JWT_SECRET, Settings, data_dir_from_mapping
 from backend.main import api_health, app, health
@@ -81,6 +82,20 @@ def test_default_cors_origins_cover_web_and_desktop_frontends() -> None:
 
     assert "http://127.0.0.1:3000" in settings.cors_origins
     assert "http://127.0.0.1:13000" in settings.cors_origins
+
+
+def test_cors_preflight_allows_the_local_ui_verification_server() -> None:
+    response = TestClient(app).options(
+        "/api/auth/register",
+        headers={
+            "Origin": "http://127.0.0.1:3010",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:3010"
 
 
 def test_data_dir_uses_desktop_runtime_override(tmp_path: Path) -> None:

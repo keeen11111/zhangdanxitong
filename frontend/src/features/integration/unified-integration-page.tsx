@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input";
 import { mergeFileRecords } from "@/lib/file-list";
 import { cn } from "@/lib/utils";
+import { isEncryptedWorkbookFailure, promptForWorkbookPassword } from "./workbook-password";
 
 type Result = IntegrationResult | PipelineExportResult;
 
@@ -65,7 +66,20 @@ export function UnifiedIntegrationPage({ projectId }: { projectId: string }) {
     setUploading(true);
     setUploadFailures([]);
     try {
-      const uploadResult = await api.uploadFilesIndividually(projectId, excelFiles);
+      let uploadResult = await api.uploadFilesIndividually(
+        projectId,
+        excelFiles,
+        "source",
+      );
+      const encryptedFiles = excelFiles.filter((file) => uploadResult.failed.some((failure) => failure.filename === file.name && isEncryptedWorkbookFailure(failure)));
+      if (encryptedFiles.length) {
+        const password = promptForWorkbookPassword();
+        if (password !== undefined) {
+          const retry = await api.uploadFilesIndividually(projectId, encryptedFiles, "source", password);
+          const encryptedNames = new Set(encryptedFiles.map((file) => file.name));
+          uploadResult = { uploaded: [...uploadResult.uploaded, ...retry.uploaded], failed: [...uploadResult.failed.filter((failure) => !encryptedNames.has(failure.filename)), ...retry.failed] };
+        }
+      }
       const failures = [...unsupportedFiles, ...uploadResult.failed];
       setUploadFailures(failures);
       if (uploadResult.uploaded.length) {
@@ -112,36 +126,35 @@ export function UnifiedIntegrationPage({ projectId }: { projectId: string }) {
   const openResult = () => router.push(`/projects/${projectId}/result`);
 
   return (
-    <div className="mx-auto max-w-6xl space-y-5 pb-8">
-      <header>
-        <p className="text-sm text-slate-500">{project?.salary_month || "本月"}工资整合</p>
-        <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">生成统一工资核算总表</h1>
+    <div className="payroll-page max-w-6xl pb-8">
+      <header className="border-b border-slate-200/90 pb-7">
+        <p className="payroll-kicker">{project?.salary_month || "本月"}工资整合</p>
+        <h1 className="page-heading mt-2">生成统一工资核算总表</h1>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">加入本月全部 Excel 后开始整合。制作完成后在成果页查收总表和单独的人工处理表。</p>
       </header>
 
       {result?.filename ? (
-        <section className="flex flex-col gap-3 rounded-xl border border-emerald-200 bg-emerald-50/60 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <section className="flex flex-col gap-3 rounded-lg border border-emerald-200 bg-emerald-50/60 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-start gap-3">
             <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" />
             <div><p className="text-sm font-semibold text-emerald-950">已有制作结果</p><p className="mt-1 text-xs text-emerald-800">{result.filename} · {result.issue_count} 项待人工处理</p></div>
           </div>
-          <Button onClick={openResult} className="bg-sky-700 hover:bg-sky-800">查看制作结果</Button>
+          <Button onClick={openResult} className="bg-emerald-700 shadow-sm hover:bg-emerald-800">查看制作结果</Button>
         </section>
       ) : null}
 
-      <section className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5">
+      <section className="rounded-lg border border-slate-200/90 bg-white p-4 shadow-[0_1px_2px_rgba(15,23,42,0.03)] sm:p-5">
         <input ref={inputRef} className="hidden" type="file" accept=".xlsx,.xls" multiple onChange={(event) => { void uploadFiles(Array.from(event.target.files || [])); event.target.value = ""; }} />
         <button
           type="button" disabled={uploading} onClick={() => inputRef.current?.click()}
           onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setDragging(false)}
           onDrop={(event) => { event.preventDefault(); setDragging(false); void uploadFiles(Array.from(event.dataTransfer.files)); }}
-          className={cn("flex w-full items-center justify-center gap-3 rounded-lg border border-dashed px-5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-700 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-70", files.length ? "min-h-20" : "min-h-36", dragging ? "border-sky-600 bg-sky-50" : "border-slate-300 bg-slate-50 hover:border-sky-500 hover:bg-sky-50/60")}
+          className={cn("flex w-full cursor-pointer items-center justify-center gap-3 rounded-lg border border-dashed px-5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-700 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-70", files.length ? "min-h-20" : "min-h-36", dragging ? "border-blue-600 bg-blue-50" : "border-slate-300 bg-slate-50 hover:border-blue-500 hover:bg-blue-50/60")}
         >
-          {uploading ? <Loader2 className="h-5 w-5 shrink-0 animate-spin text-sky-700" /> : <Upload className="h-5 w-5 shrink-0 text-sky-700" />}
+          {uploading ? <Loader2 className="h-5 w-5 shrink-0 animate-spin text-blue-700" /> : <Upload className="h-5 w-5 shrink-0 text-blue-700" />}
           <span><span className="block text-sm font-medium text-slate-900">{uploading ? "正在添加文件…" : "拖入全部 Excel，或点击选择"}</span><span className="mt-0.5 block text-xs text-slate-500">支持一次选择多个 .xlsx / .xls 文件</span></span>
         </button>
-
-        {files.length ? <div className="mt-4 flex flex-col gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs leading-5 text-slate-600"><span className="font-medium text-slate-900">{files.length} 个文件已就绪</span> · 完成后进入独立成果页查收</p><Button onClick={generateWorkbook} disabled={integrating || uploading} className="w-full min-w-36 bg-sky-700 hover:bg-sky-800 sm:w-auto">{integrating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{integrating ? "正在整合…" : "开始整合"}</Button></div> : null}
+        {files.length ? <div className="mt-4 flex flex-col gap-3 rounded-lg border border-blue-100 bg-blue-50/50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs leading-5 text-slate-600"><span className="font-medium text-slate-900">{files.length} 个文件已就绪</span> · 完成后进入独立成果页查收</p><Button onClick={generateWorkbook} disabled={integrating || uploading} className="w-full min-w-36 bg-blue-700 shadow-sm hover:bg-blue-800 sm:w-auto">{integrating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}{integrating ? "正在整合…" : "开始整合"}</Button></div> : null}
 
         <div className="mt-4" aria-live="polite">
           <div className="flex flex-col gap-3 border-b border-slate-200 pb-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-baseline gap-2"><h2 className="text-sm font-medium text-slate-900">已添加文件</h2><span className="text-xs tabular-nums text-slate-500">{files.length} 个</span></div>{files.length > 6 ? <label className="relative block sm:w-64"><Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" /><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名" aria-label="搜索文件名" className="h-9 bg-white pl-9" /></label> : null}</div>

@@ -106,3 +106,79 @@ def test_recording_experience_does_not_overwrite_a_previous_review(tmp_path, mon
         )
 
     assert error.value.status_code == 409
+
+
+def test_agent_memory_endpoint_records_a_tenant_scoped_rule_with_metadata(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(experiences, "experience_store", ExperienceStore(tmp_path))
+
+    result = experiences.record_agent_memory(
+        experiences.AgentMemoryRecordIn(
+            diff_type="bonus_source",
+            conditions={"人员类别": "店员", "姓名": "张三"},
+            decision="confirmed",
+            updates={"奖金来源": "J"},
+            note="店员优先使用唯一非零来源。",
+            period_key="2026-07",
+            evidence={"source": "对话"},
+        ),
+        user=SimpleNamespace(id="user-1", tenant_id="tenant-a"),
+    )
+
+    assert result.status == "candidate"
+    assert result.conditions == {"人员类别": "店员"}
+    assert result.period_key == "2026-07"
+    assert result.evidence == {"source": "对话"}
+
+
+def test_agent_memory_suggestions_are_tenant_isolated_and_include_metadata(tmp_path, monkeypatch) -> None:
+    store = ExperienceStore(tmp_path)
+    monkeypatch.setattr(experiences, "experience_store", store)
+    store.record_memory(
+        tenant_id="tenant-a",
+        diff_type="bonus_source",
+        item={"人员类别": "店员"},
+        match_fields=["人员类别"],
+        decision="confirmed",
+        updates={"奖金来源": "J"},
+        note="唯一非零来源。",
+        period_key="2026-07",
+    )
+
+    result = experiences.suggest_agent_memory(
+        experiences.AgentMemorySuggestIn(
+            diff_type="bonus_source",
+            item={"人员类别": "店员"},
+            metadata={"include_rule_metadata": True},
+        ),
+        user=SimpleNamespace(id="user-2", tenant_id="tenant-a"),
+    )
+    other_tenant = experiences.suggest_agent_memory(
+        experiences.AgentMemorySuggestIn(
+            diff_type="bonus_source",
+            item={"人员类别": "店员"},
+        ),
+        user=SimpleNamespace(id="user-3", tenant_id="tenant-b"),
+    )
+
+    assert result.total == 1
+    assert result.suggestions[0].status == "candidate"
+    assert result.suggestions[0].period_key == "2026-07"
+    assert other_tenant.total == 0
+
+
+def test_agent_memory_input_rejects_missing_conditions_and_unknown_fields() -> None:
+    with pytest.raises(Exception):
+        experiences.AgentMemoryRecordIn(
+            diff_type="bonus_source",
+            decision="confirmed",
+            note="缺少条件。",
+        )
+
+    with pytest.raises(Exception):
+        experiences.AgentMemoryRecordIn(
+            diff_type="bonus_source",
+            conditions={"人员类别": "店员"},
+            decision="confirmed",
+            note="不允许额外字段。",
+            unexpected="value",
+        )

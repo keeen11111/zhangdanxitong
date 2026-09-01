@@ -1,226 +1,93 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { ArrowRight, CalendarDays, CheckCircle2, Clock3, FileSpreadsheet, FolderKanban, Loader2, Plus, Search, X } from "lucide-react";
 import { toast } from "sonner";
-import {
-  Plus,
-  FolderKanban,
-  Calendar,
-  FileText,
-  Trash2,
-  ArrowRight,
-  Loader2,
-} from "lucide-react";
 
-import { api, Project } from "@/lib/api";
+import { api, getStoredUser, Project } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 
-const STATUS_LABEL: Record<string, { text: string; cls: string }> = {
-  import: { text: "数据导入", cls: "bg-slate-100 text-slate-700" },
-  config: { text: "字段映射", cls: "bg-teal-50 text-teal-700" },
-  work: { text: "诊断补齐", cls: "bg-amber-100 text-amber-700" },
-  export: { text: "可导出", cls: "bg-green-100 text-green-700" },
-};
+function dateLabel(value?: string | null) {
+  if (!value) return "暂无记录";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value.replace("T", " ").slice(0, 16);
+  return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+}
+
+function statusFor(project: Project) {
+  if (!project.file_count) return { label: "等待文件", tone: "text-slate-500", dot: "bg-slate-300" };
+  if (project.pending_issue_count > 0) return { label: `${project.pending_issue_count} 项待确认`, tone: "text-amber-700", dot: "bg-amber-500" };
+  if (project.has_result) return { label: "已完成", tone: "text-emerald-700", dot: "bg-emerald-500" };
+  return { label: "可以开始分析", tone: "text-blue-700", dot: "bg-blue-500" };
+}
 
 export default function ProjectsPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const user = getStoredUser();
   const [projects, setProjects] = useState<Project[]>([]);
+  const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
-  const [open, setOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState("");
-  const [month, setMonth] = useState("2026.06");
+  const [month, setMonth] = useState(() => {
+    const now = new Date();
+    return `${now.getFullYear()}.${String(now.getMonth() + 1).padStart(2, "0")}`;
+  });
 
   async function load() {
-    try {
-      const list = await api.listProjects();
-      setProjects(list);
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "加载失败");
-    } finally {
-      setLoading(false);
-    }
+    setLoading(true);
+    try { setProjects(await api.listProjects()); }
+    catch (error) { toast.error(error instanceof Error ? error.message : "项目列表加载失败"); }
+    finally { setLoading(false); }
   }
+
+  useEffect(() => { void load(); }, []);
 
   useEffect(() => {
-    load();
-  }, []);
+    if (searchParams.get("create") !== "1") return;
+    setShowCreate(true);
+    router.replace("/projects");
+  }, [router, searchParams]);
 
-  async function onCreate(e: React.FormEvent) {
-    e.preventDefault();
+  async function createProject(event: React.FormEvent) {
+    event.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed) return;
     setCreating(true);
     try {
-      const p = await api.createProject({ name, salary_month: month });
-      toast.success("项目已创建");
-      setOpen(false);
-      router.push(`/projects/${p.id}`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "创建失败");
-    } finally {
-      setCreating(false);
-    }
+      const project = await api.createProject({ name: trimmed, salary_month: month.trim() });
+      toast.success("已创建月度处理");
+      router.push(`/projects/${project.id}/agent`);
+    } catch (error) { toast.error(error instanceof Error ? error.message : "创建失败"); }
+    finally { setCreating(false); }
   }
 
-  async function onDelete(p: Project) {
-    if (!confirm(`确认删除项目「${p.name}」？此操作不可撤销。`)) return;
-    try {
-      await api.deleteProject(p.id);
-      toast.success("已删除");
-      load();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "删除失败");
-    }
-  }
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return projects.filter((project) => !needle || `${project.name} ${project.salary_month}`.toLowerCase().includes(needle));
+  }, [projects, query]);
+  const pending = projects.reduce((sum, item) => sum + item.pending_issue_count, 0);
+  const completed = projects.filter((item) => item.has_result && item.pending_issue_count === 0).length;
 
-  return (
-    <div className="mx-auto max-w-7xl space-y-6">
-      {/* 页头 */}
-      <div className="flex flex-col gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="mb-1 text-xs font-semibold uppercase tracking-[0.16em] text-teal-700">Payroll workspace</p>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-950">薪资项目</h1>
-          <p className="mt-1.5 text-sm text-muted-foreground">集中管理每个月度薪资批次及其处理进度</p>
-        </div>
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild>
-            <Button className="shadow-sm">
-              <Plus className="mr-2 h-4 w-4" />
-              新建项目
-            </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>新建薪资项目</DialogTitle>
-              <DialogDescription>为本月薪资批次创建一个处理空间</DialogDescription>
-            </DialogHeader>
-            <form onSubmit={onCreate} className="space-y-4 py-2">
-              <div className="space-y-2">
-                <Label htmlFor="pname">项目名称</Label>
-                <Input
-                  id="pname"
-                  required
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="如：2026年6月薪资批次"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="pmonth">薪资月份</Label>
-                <Input
-                  id="pmonth"
-                  required
-                  value={month}
-                  onChange={(e) => setMonth(e.target.value)}
-                  placeholder="2026.06"
-                />
-              </div>
-              <DialogFooter>
-                <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-                  取消
-                </Button>
-                <Button type="submit" disabled={creating}>
-                  {creating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                  创建并开始
-                </Button>
-              </DialogFooter>
-            </form>
-          </DialogContent>
-        </Dialog>
-      </div>
+  return <div className="payroll-page max-w-[1180px]">
+    <header className="flex flex-col gap-5 border-b border-slate-200/90 pb-7 sm:flex-row sm:items-end sm:justify-between">
+      <div><p className="payroll-kicker">Financial workspace</p><h1 className="page-heading mt-2">项目</h1><p className="mt-2 max-w-xl text-sm leading-6 text-slate-600">选择项目，继续上次的月度处理，或从一批新文件开始。</p>{user?.tenant_name ? <p className="mt-3 text-xs text-slate-400">当前工作区：{user.tenant_name}</p> : null}</div>
+      <Button type="button" className="h-10 bg-blue-700 px-4 text-sm text-white shadow-sm hover:bg-blue-800" onClick={() => setShowCreate(true)}><Plus className="mr-2 h-4 w-4" />新建月度处理</Button>
+    </header>
 
-      {!loading && projects.length > 0 && (
-        <div className="grid overflow-hidden rounded-lg border bg-white sm:grid-cols-3 sm:divide-x">
-          <div className="border-b px-5 py-4 sm:border-b-0">
-            <div className="text-xs font-medium text-slate-500">项目总数</div>
-            <div className="mt-1 text-2xl font-semibold text-slate-900">{projects.length}</div>
-          </div>
-          <div className="border-b px-5 py-4 sm:border-b-0">
-            <div className="text-xs font-medium text-slate-500">已导入文件</div>
-            <div className="mt-1 text-2xl font-semibold text-slate-900">{projects.reduce((sum, project) => sum + project.file_count, 0)}</div>
-          </div>
-          <div className="px-5 py-4">
-            <div className="text-xs font-medium text-slate-500">最近薪资月份</div>
-            <div className="mt-1 text-2xl font-semibold text-slate-900">{projects[0]?.salary_month || "—"}</div>
-          </div>
-        </div>
-      )}
+    <section className="metric-strip grid sm:grid-cols-3 sm:divide-x sm:divide-slate-200/90" aria-label="工作区摘要"><div className="border-b border-slate-200/90 px-5 py-4 sm:border-b-0"><p className="text-xs text-slate-500">项目处理</p><p className="mt-1 text-2xl font-semibold tabular-nums text-slate-950">{projects.length}</p></div><div className="border-b border-slate-200/90 px-5 py-4 sm:border-b-0"><p className="text-xs text-slate-500">待回答问题</p><p className={pending ? "mt-1 text-2xl font-semibold tabular-nums text-amber-700" : "mt-1 text-2xl font-semibold tabular-nums text-slate-950"}>{pending}</p></div><div className="px-5 py-4"><p className="text-xs text-slate-500">已完成批次</p><p className="mt-1 text-2xl font-semibold tabular-nums text-emerald-700">{completed}</p></div></section>
 
-      {/* 项目列表 */}
-      {loading ? (
-        <div className="flex h-52 items-center justify-center rounded-lg border bg-white text-muted-foreground" aria-busy="true">
-          <Loader2 className="mr-2 h-5 w-5 animate-spin" /> 加载中...
-        </div>
-      ) : projects.length === 0 ? (
-        <Card className="border-dashed bg-white shadow-none">
-          <CardContent className="flex flex-col items-center justify-center py-16 text-center">
-            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-lg border bg-slate-50">
-              <FolderKanban className="h-5 w-5 text-slate-500" />
-            </div>
-            <h2 className="text-sm font-semibold text-slate-900">还没有薪资项目</h2>
-            <p className="mt-1 text-sm text-muted-foreground">创建第一个月度批次，开始导入和处理数据</p>
-          </CardContent>
-        </Card>
-      ) : (
-        <section className="overflow-hidden rounded-lg border bg-white" aria-labelledby="project-list-title">
-          <div className="flex items-center justify-between border-b px-4 py-3 sm:px-5">
-            <div>
-              <h2 id="project-list-title" className="text-sm font-semibold text-slate-900">项目列表</h2>
-              <p className="mt-0.5 text-xs text-slate-500">选择一个项目继续处理</p>
-            </div>
-            <Badge variant="outline" className="font-normal text-slate-500">{projects.length} 个项目</Badge>
-          </div>
-          <div className="hidden grid-cols-[minmax(0,1fr)_120px_120px_120px_48px] border-b bg-slate-50 px-5 py-2 text-[11px] font-medium uppercase tracking-wider text-slate-500 md:grid">
-            <span>项目</span><span>薪资月份</span><span>文件</span><span>状态</span><span />
-          </div>
-          <div className="divide-y">
-            {projects.map((p) => {
-              const st = STATUS_LABEL[p.status] || STATUS_LABEL.import;
-              return (
-                <div key={p.id} className="group flex items-center transition-colors hover:bg-slate-50/80">
-                  <Link href={`/projects/${p.id}`} className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-4 sm:px-5 md:grid-cols-[minmax(0,1fr)_120px_120px_120px]">
-                    <span className="flex min-w-0 items-center gap-3">
-                      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border bg-white text-teal-700">
-                        <FileText className="h-4 w-4" />
-                      </span>
-                      <span className="min-w-0">
-                        <span className="block truncate text-sm font-semibold text-slate-900">{p.name}</span>
-                        <span className="mt-0.5 block text-xs text-slate-500 md:hidden">{p.salary_month} · {p.file_count} 个文件</span>
-                      </span>
-                    </span>
-                    <ArrowRight className="h-4 w-4 text-slate-300 transition-transform group-hover:translate-x-0.5 group-hover:text-teal-700 md:hidden" />
-                    <span className="hidden items-center gap-1.5 text-xs text-slate-600 md:flex"><Calendar className="h-3.5 w-3.5" />{p.salary_month}</span>
-                    <span className="hidden text-xs text-slate-600 md:block">{p.file_count} 个文件</span>
-                    <span className="hidden md:block"><Badge variant="secondary" className={st.cls}>{st.text}</Badge></span>
-                  </Link>
-                  <button
-                    onClick={() => onDelete(p)}
-                    className="mr-3 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-red-50 hover:text-red-600 sm:mr-4"
-                    aria-label={`删除项目 ${p.name}`}
-                    title="删除项目"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
-    </div>
-  );
+    <div className="mt-9 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="text-base font-semibold text-slate-950">最近项目</h2><p className="mt-1 text-xs text-slate-500">每个项目拥有独立的对话、上下文和处理经验。</p></div><label className="relative block sm:w-72"><span className="sr-only">搜索项目</span><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目或月份" className="h-10 border-slate-300 bg-white pl-9 shadow-sm" /></label></div>
+
+    {loading ? <div className="mt-4 flex h-48 items-center justify-center rounded-lg border border-slate-200/90 bg-white text-sm text-slate-500 shadow-[0_1px_2px_rgba(15,23,42,0.03)]" aria-busy="true"><Loader2 className="mr-2 h-4 w-4 animate-spin text-blue-700" />正在加载项目...</div> : null}
+    {!loading && !visible.length ? <section className="mt-4 rounded-lg border border-dashed border-slate-300 bg-white px-6 py-16 text-center shadow-[0_1px_2px_rgba(15,23,42,0.03)]"><FolderKanban className="mx-auto h-8 w-8 text-slate-300" /><h2 className="mt-4 text-sm font-semibold text-slate-900">{projects.length ? "没有匹配的项目" : "还没有项目处理记录"}</h2><p className="mt-1 text-sm text-slate-500">{projects.length ? "换个搜索条件试试。" : "创建一次月度处理，Agent 会在对话中完成剩余步骤。"}</p>{!projects.length ? <Button type="button" className="mt-5 bg-blue-700 hover:bg-blue-800" onClick={() => setShowCreate(true)}><Plus className="mr-2 h-4 w-4" />创建第一个项目</Button> : null}</section> : null}
+    {!loading && visible.length ? <section className="mt-4 overflow-hidden rounded-lg border border-slate-200/90 bg-white shadow-[0_1px_2px_rgba(15,23,42,0.03)]" aria-label="项目列表"><div className="divide-y divide-slate-200/90">{visible.map((project) => { const state = statusFor(project); return <Link key={project.id} href={`/projects/${project.id}/agent`} className="group flex min-w-0 items-center gap-4 px-4 py-4 transition-colors hover:bg-blue-50/40 focus-visible:relative focus-visible:z-10 sm:px-5"><span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-700"><FolderKanban className="h-5 w-5" /></span><span className="min-w-0 flex-1"><span className="flex flex-wrap items-center gap-x-3 gap-y-1"><span className="truncate text-sm font-semibold text-slate-950">{project.name}</span><span className="inline-flex items-center gap-1.5 text-xs text-slate-500"><CalendarDays className="h-3.5 w-3.5" />所属月 {project.salary_month}</span></span><span className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500"><span className={`inline-flex items-center gap-1.5 font-medium ${state.tone}`}><span className={`h-1.5 w-1.5 rounded-full ${state.dot}`} />{state.label}</span><span className="inline-flex items-center gap-1.5"><FileSpreadsheet className="h-3.5 w-3.5" />{project.file_count} 个文件</span><span className="inline-flex items-center gap-1.5"><Clock3 className="h-3.5 w-3.5" />最近 {dateLabel(project.updated_at || project.created_at)}</span></span></span><span className="hidden text-xs font-medium text-blue-700 sm:inline-flex sm:items-center sm:gap-1 opacity-0 transition-opacity group-hover:opacity-100">进入对话<ArrowRight className="h-3.5 w-3.5" /></span><ArrowRight className="h-4 w-4 shrink-0 text-slate-300 sm:hidden" /></Link>; })}</div></section> : null}
+
+    {showCreate ? <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-labelledby="new-run-title"><div className="w-full max-w-md rounded-xl border border-slate-200 bg-white shadow-2xl"><div className="flex items-start justify-between border-b border-slate-200 px-5 py-4"><div><h2 id="new-run-title" className="text-base font-semibold text-slate-950">新建月度处理</h2><p className="mt-1 text-xs text-slate-500">先建立项目上下文，进入对话后再上传文件。</p></div><button type="button" className="inline-flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700" onClick={() => setShowCreate(false)} aria-label="关闭"><X className="h-4 w-4" /></button></div><form onSubmit={createProject} className="space-y-4 px-5 py-5"><div><label htmlFor="project-name" className="mb-1.5 block text-sm font-medium text-slate-700">项目名称</label><Input id="project-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：北京科园" required autoFocus /></div><div><label htmlFor="salary-month" className="mb-1.5 block text-sm font-medium text-slate-700">所属月</label><Input id="salary-month" value={month} onChange={(event) => setMonth(event.target.value)} placeholder="2026.07" required /></div><div className="flex justify-end gap-2 border-t border-slate-100 pt-4"><Button type="button" variant="outline" onClick={() => setShowCreate(false)}>取消</Button><Button type="submit" className="bg-blue-700 hover:bg-blue-800" disabled={creating}>{creating ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <CheckCircle2 className="mr-2 h-4 w-4" />}创建并进入对话</Button></div></form></div></div> : null}
+  </div>;
 }

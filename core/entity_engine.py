@@ -883,16 +883,17 @@ def _parse_bonus_sheet(
             if not src_col:
                 continue
             # 绩效奖金
-            if "绩效奖金" in src_col and "月" in src_col:
-                sal_rec["绩效奖金"] = _clean_value(row.get(src_col), "amount")
+            if "绩效奖金" in src_col and ("月" in src_col or "季度" in src_col):
+                value = _clean_value(row.get(src_col), "amount")
+                sal_rec["绩效奖金"] = (sal_rec.get("绩效奖金") or 0) + (value or 0)
             elif "提成" in src_col:
                 sal_rec["业绩奖金"] = _clean_value(row.get(src_col), "amount")
             elif "计件" in src_col:
                 sal_rec["DTP绩效奖金"] = _clean_value(row.get(src_col), "amount")
-            elif "项目奖金" in src_col and "DTP" in src_col:
-                sal_rec["DTP绩效奖金"] = _clean_value(row.get(src_col), "amount")
             elif "项目奖金" in src_col and "非DTP" in src_col:
                 sal_rec["业绩奖金"] = _clean_value(row.get(src_col), "amount")
+            elif "项目奖金" in src_col and "DTP" in src_col:
+                sal_rec["DTP绩效奖金"] = _clean_value(row.get(src_col), "amount")
         sal_records.append(sal_rec)
 
     return emp_records, sal_records, name_to_id

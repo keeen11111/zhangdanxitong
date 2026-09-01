@@ -1,4 +1,5 @@
 """项目空间路由：CRUD + 文件上传/预览。"""
+import json
 import os
 import subprocess
 import tempfile
@@ -10,18 +11,109 @@ from zipfile import BadZipFile, ZipFile
 
 import openpyxl
 import pandas as pd
+try:
+    import xlrd
+except ImportError:  # pragma: no cover - optional fallback for minimal installs
+    xlrd = None
+from msoffcrypto import OfficeFile
+from msoffcrypto.exceptions import DecryptionError, FileFormatError, InvalidKeyError, ParseError
 from fastapi import APIRouter, Depends, HTTPException, UploadFile as FastUploadFile, File, Form, Query
 from sqlalchemy.orm import Session
 
 from backend.auth import get_current_user, require_tenant_match
-from backend.database import get_db, UPLOAD_DIR
+from backend.database import DATA_DIR, get_db, UPLOAD_DIR
 from backend.models import User, Project, UploadFile
 from backend.schemas import ProjectIn, ProjectOut, FileOut, FilePreview, FileTypeUpdateIn
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+SESSION_DIR = os.path.join(DATA_DIR, "sessions")
 
 # 允许的文件类型
-_ALLOWED_TYPES = {"last_month", "current", "social", "template", "source"}
+_ALLOWED_TYPES = {
+    "last_month",
+    "current",
+    "social",
+    "template",
+    "financial_master",
+    "financial_source",
+    "source",
+}
+
+
+def _project_result_summary(project_id: str) -> dict[str, object]:
+    """Return the latest usable result state for either supported flow.
+
+    The project row's legacy ``status`` only represents the import wizard. A
+    completed integration is stored separately so historic projects can open
+    their existing result instead of restarting the import flow.
+    """
+    empty = {
+        "has_result": False,
+        "result_completed_at": None,
+        "pending_issue_count": 0,
+    }
+    meta_path = os.path.join(SESSION_DIR, f"{project_id}_export_meta.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fp:
+            meta = json.load(fp)
+    except (OSError, ValueError, TypeError):
+        meta = None
+
+    if isinstance(meta, dict) and meta.get("status") not in {"processing", "blocked", "stale"} and meta.get("filename"):
+        completed_at = meta.get("completed_at")
+        try:
+            pending_issue_count = max(0, int(meta.get("issue_count", 0) or 0))
+        except (TypeError, ValueError):
+            pending_issue_count = 0
+        return {
+            "has_result": True,
+            "result_completed_at": completed_at if isinstance(completed_at, str) and completed_at else None,
+            "pending_issue_count": pending_issue_count,
+        }
+
+    financial_meta_path = os.path.join(
+        DATA_DIR,
+        "financial-workbook-integrations",
+        project_id,
+        "latest.json",
+    )
+    try:
+        with open(financial_meta_path, "r", encoding="utf-8") as fp:
+            financial_meta = json.load(fp)
+    except (OSError, ValueError, TypeError):
+        return empty
+
+    if not isinstance(financial_meta, dict):
+        return empty
+    if financial_meta.get("status") not in {"review_required", "ready_for_release", "published"}:
+        return empty
+    if not financial_meta.get("filename"):
+        return empty
+
+    completed_at = financial_meta.get("completed_at")
+    issues = financial_meta.get("issues", [])
+    return {
+        "has_result": True,
+        "result_completed_at": completed_at if isinstance(completed_at, str) and completed_at else None,
+        "pending_issue_count": len(issues) if isinstance(issues, list) else 0,
+    }
+
+
+def _project_out(project: Project) -> ProjectOut:
+    """Build the project list payload with the latest integration result state."""
+    summary = _project_result_summary(project.id)
+    output = ProjectOut.from_orm(project)
+    output.file_count = len(project.files)
+    output.has_result = bool(summary["has_result"])
+    completed_at = summary["result_completed_at"]
+    if isinstance(completed_at, str):
+        try:
+            output.result_completed_at = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        except ValueError:
+            output.result_completed_at = None
+    output.pending_issue_count = int(summary["pending_issue_count"])
+    return output
+_SINGLE_MASTER_FILE_TYPES = {"template", "financial_master"}
 
 _OLE_WORKBOOK_SIGNATURE = bytes.fromhex("D0 CF 11 E0 A1 B1 1A E1")
 _OOXML_WORKBOOK_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
@@ -32,7 +124,7 @@ _ENCRYPTED_OOXML_STREAM_NAMES = (
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _MAX_UNCOMPRESSED_WORKBOOK_BYTES = 1024 * 1024 * 1024
 _MAX_WORKBOOK_ARCHIVE_ENTRIES = 20_000
-_DESKTOP_CONVERSION_TIMEOUT_SECONDS = 180
+_DESKTOP_CONVERSION_TIMEOUT_SECONDS = 60
 
 _MASTER_SUPPORT_SHEETS = {
     "工资汇总表",
@@ -98,7 +190,12 @@ def _convert_legacy_excel_with_desktop_excel(
         raise ValueError(f"不支持的 Excel 源扩展名：{source_extension}")
     source_format_label = "加密的 .xlsx" if source_extension == ".xlsx" else "旧版 .xls"
 
-    with tempfile.TemporaryDirectory(prefix="payroll_excel_") as temp_dir:
+    # A desktop spreadsheet process may briefly keep the source file open even
+    # after a timeout.  Cleanup must never mask the actionable HTTP error.
+    with tempfile.TemporaryDirectory(
+        prefix="payroll_excel_",
+        ignore_cleanup_errors=True,
+    ) as temp_dir:
         source_path = os.path.join(temp_dir, f"source{source_extension}")
         output_path = os.path.join(temp_dir, "converted.xlsx")
         with open(source_path, "wb") as source:
@@ -123,7 +220,9 @@ try {{
   $excel.DisplayAlerts = $false
   try {{ $excel.AutomationSecurity = 3 }} catch {{}}
   try {{ $excel.AskToUpdateLinks = $false }} catch {{}}
-  $workbook = $excel.Workbooks.Open({ps_literal(source_path)}, 0, $false)
+  # Pass an explicit empty password and disable recommendations so an encrypted
+  # legacy workbook fails instead of opening an invisible password dialog.
+  $workbook = $excel.Workbooks.Open({ps_literal(source_path)}, 0, $false, 5, '', '', $true)
   # OLE input may be a true legacy workbook or a password-encrypted OOXML
   # package.  The application has already opened it in the current desktop
   # session; clear file-level encryption so the backend can inspect and update
@@ -136,19 +235,38 @@ try {{
   if ($null -ne $excel) {{ $excel.Quit() }}
 }}
 """
+        process = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=_DESKTOP_CONVERSION_TIMEOUT_SECONDS,
-                check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            stdout, stderr = process.communicate(timeout=_DESKTOP_CONVERSION_TIMEOUT_SECONDS)
+            completed = subprocess.CompletedProcess(
+                process.args,
+                process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
         except subprocess.TimeoutExpired as exc:
+            if process is not None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.communicate(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
             raise HTTPException(
                 status_code=408,
-                detail="总表需要 Excel/WPS 自动转换，但 3 分钟内未完成；请关闭占用该文件的窗口后重试",
+                detail=(
+                    "旧版 .xls 总表需要 Excel/WPS 自动转换，但 60 秒内未完成；"
+                    "请关闭占用该文件的窗口，或另存为 .xlsx 后重试"
+                ),
             ) from exc
         except OSError as exc:
             raise HTTPException(
@@ -176,15 +294,94 @@ try {{
         return converted_content
 
 
-def _normalize_excel_content(content: bytes) -> tuple[bytes, str]:
+def _convert_legacy_xls_with_xlrd(content: bytes) -> bytes:
+    """Normalize a readable BIFF workbook when no desktop converter is available.
+
+    This fallback is intentionally value-only. Legacy tax attachments used by
+    the payroll workflow are source evidence, so preserving their values and
+    sheet names is safer than blocking the whole batch on a missing Excel COM
+    installation. Desktop conversion remains the first choice because it keeps
+    richer legacy formatting when available.
+    """
+    if xlrd is None:
+        raise HTTPException(
+            status_code=400,
+            detail="检测到旧版 .xls 文件，但当前环境没有可用的 .xls 解析器；请安装 xlrd 或另存为 .xlsx 后重试",
+        )
+    try:
+        legacy = xlrd.open_workbook(file_contents=content, on_demand=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="旧版 .xls 文件无法解析，请确认文件未损坏") from exc
+
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    try:
+        for sheet_index in range(legacy.nsheets):
+            source_sheet = legacy.sheet_by_index(sheet_index)
+            title = str(source_sheet.name or f"Sheet{sheet_index + 1}")[:31] or f"Sheet{sheet_index + 1}"
+            # Excel sheet names must be unique after the 31-character limit.
+            base_title = title
+            suffix = 1
+            while title in workbook.sheetnames:
+                suffix += 1
+                title = f"{base_title[:31 - len(str(suffix)) - 1]}_{suffix}"
+            target_sheet = workbook.create_sheet(title)
+            for row_index in range(source_sheet.nrows):
+                for column_index in range(source_sheet.ncols):
+                    cell = source_sheet.cell(row_index, column_index)
+                    value = cell.value
+                    if cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            value = xlrd.xldate_as_datetime(value, legacy.datemode)
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                    elif cell.ctype == xlrd.XL_CELL_ERROR:
+                        # Preserve the visible error marker as text; it must
+                        # never become an executable formula or an exception.
+                        value = f"#ERR:{cell.value}"
+                    target_sheet.cell(row=row_index + 1, column=column_index + 1, value=value)
+        output = BytesIO()
+        workbook.save(output)
+        return output.getvalue()
+    finally:
+        workbook.close()
+
+
+def _decrypt_encrypted_ooxml(content: bytes, password: str) -> bytes:
+    """Decrypt an OOXML workbook in memory without persisting its password."""
+    if not password:
+        raise HTTPException(status_code=400, detail="检测到加密的 Excel 文件，请在上传区域输入打开密码后重试")
+    try:
+        encrypted = OfficeFile(BytesIO(content))
+        encrypted.load_key(password=password, verify_password=True)
+        decrypted = BytesIO()
+        encrypted.decrypt(decrypted, verify_integrity=True)
+    except InvalidKeyError as exc:
+        raise HTTPException(status_code=400, detail="Excel 打开密码不正确，请重新输入") from exc
+    except (DecryptionError, FileFormatError, ParseError) as exc:
+        raise HTTPException(status_code=400, detail="Excel 文件无法使用该密码解密，请确认文件和打开密码") from exc
+    return decrypted.getvalue()
+
+
+def _normalize_excel_content(content: bytes, password: str | None = None) -> tuple[bytes, str]:
     """Return an OOXML workbook and the safe storage suffix."""
     kind = _workbook_binary_kind(content)
     if kind == "xlsx":
         _validate_ooxml_archive(content)
         return content, ".xlsx"
-    if kind in {"xls", "xlsx-encrypted"}:
-        source_extension = ".xlsx" if kind == "xlsx-encrypted" else ".xls"
-        converted = _convert_legacy_excel_with_desktop_excel(content, source_extension)
+    if kind == "xlsx-encrypted":
+        decrypted = _decrypt_encrypted_ooxml(content, password or "")
+        _validate_ooxml_archive(decrypted)
+        return decrypted, ".xlsx"
+    if kind == "xls":
+        try:
+            converted = _convert_legacy_excel_with_desktop_excel(content, ".xls")
+        except HTTPException as desktop_error:
+            # CI, portable demos, and server containers commonly lack Excel or
+            # WPS. Use the read-only BIFF fallback for source workbooks.
+            if desktop_error.status_code not in {400, 408}:
+                raise
+            converted = _convert_legacy_xls_with_xlrd(content)
         _validate_ooxml_archive(converted)
         return converted, ".xlsx"
     raise HTTPException(status_code=400, detail="文件内容不是有效的 Excel 工作簿")
@@ -200,9 +397,19 @@ def _inspect_ooxml_workbook(content: bytes) -> dict[str, object]:
         sheet_names = list(workbook.sheetnames)
         populated_dimensions: list[tuple[int, int]] = []
         for sheet in workbook.worksheets:
+            if sheet.max_row is None or sheet.max_column is None:
+                # Some valid OOXML producers omit the worksheet dimension.
+                # Read-only openpyxl then exposes unknown bounds until it has
+                # scanned the sheet once.
+                try:
+                    sheet.calculate_dimension(force=True)
+                except (TypeError, ValueError):
+                    pass
+            row_count = max(0, int(sheet.max_row or 0))
+            col_count = max(0, int(sheet.max_column or 0))
             first_value = sheet.cell(1, 1).value
-            if sheet.max_row > 1 or sheet.max_column > 1 or first_value not in (None, ""):
-                populated_dimensions.append((sheet.max_row, sheet.max_column))
+            if row_count > 1 or col_count > 1 or first_value not in (None, ""):
+                populated_dimensions.append((max(1, row_count), max(1, col_count)))
     finally:
         workbook.close()
 
@@ -306,6 +513,10 @@ def _looks_like_complete_master_workbook(sheet_names: list[str]) -> bool:
 def _validate_declared_workbook_role(file_type: str, sheet_names: list[str]) -> None:
     """Enforce explicit upload roles without guessing from filenames."""
     normalized = {str(name).replace(" ", "") for name in sheet_names}
+    # A financial master is intentionally structure-agnostic.  Unlike the
+    # legacy payroll template, it must not be identified from sheet names.
+    if file_type == "financial_master":
+        return
     if file_type == "template" and "工资核算" not in normalized:
         raise HTTPException(
             status_code=400,
@@ -357,12 +568,7 @@ def _load_project_or_404(project_id: str, user: User, db: Session) -> Project:
 @router.get("", response_model=list[ProjectOut])
 def list_projects(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     qs = db.query(Project).filter(Project.owner_id == user.id).order_by(Project.updated_at.desc())
-    out = []
-    for p in qs:
-        po = ProjectOut.from_orm(p)
-        po.file_count = len(p.files)
-        out.append(po)
-    return out
+    return [_project_out(project) for project in qs]
 
 
 @router.post("", response_model=ProjectOut, status_code=201)
@@ -372,18 +578,14 @@ def create_project(payload: ProjectIn, user: User = Depends(get_current_user),
     db.add(p)
     db.commit()
     db.refresh(p)
-    po = ProjectOut.from_orm(p)
-    po.file_count = 0
-    return po
+    return _project_out(p)
 
 
 @router.get("/{project_id}", response_model=ProjectOut)
 def get_project(project_id: str, user: User = Depends(get_current_user),
                 db: Session = Depends(get_db)):
     p = _load_project_or_404(project_id, user, db)
-    po = ProjectOut.from_orm(p)
-    po.file_count = len(p.files)
-    return po
+    return _project_out(p)
 
 
 @router.delete("/{project_id}", status_code=204)
@@ -413,9 +615,7 @@ def update_status(project_id: str, status: str = Query(...),
     p.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(p)
-    po = ProjectOut.from_orm(p)
-    po.file_count = len(p.files)
-    return po
+    return _project_out(p)
 
 
 # ---------- 文件上传 ----------
@@ -423,6 +623,7 @@ def update_status(project_id: str, status: str = Query(...),
 def upload_file(project_id: str,
                 file_type: str = Form(...),
                 sheet_name: str = Form(None),
+                password: str | None = Form(default=None, max_length=256),
                 file: FastUploadFile = File(...),
                 user: User = Depends(get_current_user),
                 db: Session = Depends(get_db)):
@@ -432,17 +633,21 @@ def upload_file(project_id: str,
     started_at = time.perf_counter()
     p = _load_project_or_404(project_id, user, db)
 
-    if file_type == "template":
+    if file_type in _SINGLE_MASTER_FILE_TYPES:
         existing_master = db.query(UploadFile).filter(
             UploadFile.project_id == p.id,
-            UploadFile.file_type == "template",
+            UploadFile.file_type == file_type,
         ).first()
         if existing_master:
-            raise HTTPException(status_code=409, detail="当前项目已有总表，请先移除原总表后再上传新总表")
+            master_label = "通用财务总表" if file_type == "financial_master" else "总表"
+            raise HTTPException(
+                status_code=409,
+                detail=f"当前项目已有{master_label}，请先移除原文件后再上传新文件",
+            )
 
     original_content = _read_upload_content(file)
     original_kind = _workbook_binary_kind(original_content)
-    content, storage_extension = _normalize_excel_content(original_content)
+    content, storage_extension = _normalize_excel_content(original_content, password)
     workbook_info = _inspect_ooxml_workbook(content)
     sheet_names = [str(name) for name in workbook_info["sheet_names"]]
     _validate_declared_workbook_role(file_type, sheet_names)
@@ -477,7 +682,9 @@ def upload_file(project_id: str,
     db.refresh(rec)
     result = FileOut.from_orm(rec)
     result.processing_seconds = round(time.perf_counter() - started_at, 2)
-    if original_kind in {"xls", "xlsx-encrypted"}:
+    if original_kind == "xlsx-encrypted":
+        result.normalization_note = "已使用本次输入的打开密码解密后导入"
+    elif original_kind == "xls":
         result.normalization_note = "已通过本机 Excel/WPS 自动转换为可处理的 .xlsx"
     return result
 
@@ -486,6 +693,7 @@ def upload_file(project_id: str,
 def upload_files_batch_auto(
     project_id: str,
     files: list[FastUploadFile] = File(...),
+    password: str | None = Form(default=None, max_length=256),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -497,7 +705,7 @@ def upload_files_batch_auto(
     prepared: list[tuple[str, bytes, str, int, int, str]] = []
     for upload in files:
         filename = upload.filename or "未命名文件.xlsx"
-        content, storage_extension = _normalize_excel_content(_read_upload_content(upload))
+        content, storage_extension = _normalize_excel_content(_read_upload_content(upload), password)
         workbook_info = _inspect_ooxml_workbook(content)
         row_count = int(workbook_info["row_count"])
         col_count = int(workbook_info["col_count"])
@@ -616,14 +824,18 @@ def update_file_type(project_id: str, file_id: str, payload: FileTypeUpdateIn,
         _validate_declared_workbook_role(payload.file_type, list(workbook.sheetnames))
     finally:
         workbook.close()
-    if payload.file_type == "template":
+    if payload.file_type in _SINGLE_MASTER_FILE_TYPES:
         existing_master = db.query(UploadFile).filter(
             UploadFile.project_id == p.id,
-            UploadFile.file_type == "template",
+            UploadFile.file_type == payload.file_type,
             UploadFile.id != f.id,
         ).first()
         if existing_master:
-            raise HTTPException(status_code=409, detail="当前项目已有总表，请先移除原总表")
+            master_label = "通用财务总表" if payload.file_type == "financial_master" else "总表"
+            raise HTTPException(
+                status_code=409,
+                detail=f"当前项目已有{master_label}，请先移除原文件后再变更",
+            )
 
     f.file_type = payload.file_type
     db.commit()

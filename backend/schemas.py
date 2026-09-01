@@ -1,6 +1,6 @@
 """Pydantic 请求/响应模型。"""
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -52,6 +52,9 @@ class ProjectOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     file_count: int = 0
+    has_result: bool = False
+    result_completed_at: Optional[datetime] = None
+    pending_issue_count: int = 0
 
 # ---------- File ----------
 class FileOut(BaseModel):
@@ -78,6 +81,57 @@ class FilePreview(BaseModel):
     rows: list[dict]
     row_count: int
     col_count: int
+
+
+# ---------- 通用财务工作簿整合 ----------
+class FinancialWorkbookPublishedVersionOut(BaseModel):
+    """已发布财务账单的只读版本档案。"""
+
+    version_id: str
+    filename: str
+    original_draft_filename: str
+    auto_update_count: int
+    source_file_count: int
+    release_checks: dict[str, Any]
+    published_at: str
+    published_by: dict[str, str]
+    sha256: str
+
+
+class FinancialWorkbookIntegrationOut(BaseModel):
+    """一次通用财务工作簿整合的可下载结果。"""
+
+    filename: str
+    review_filename: str | None = None
+    auto_update_count: int
+    source_file_count: int
+    issues: list[dict[str, Any]]
+    matches: list[dict[str, Any]]
+    updates: list[dict[str, Any]]
+    status: str
+    release_checks: dict[str, Any]
+    completed_at: str
+    published_at: str | None = None
+    published_version: FinancialWorkbookPublishedVersionOut | None = None
+
+
+class FinancialWorkQueueItemOut(BaseModel):
+    """需要操作人员立即处理的通用财务批次。"""
+
+    project_id: str
+    project_name: str
+    salary_month: str
+    status: str
+    issue_count: int
+    action_label: str
+    completed_at: str
+
+
+class FinancialWorkQueueOut(BaseModel):
+    items: list[FinancialWorkQueueItemOut]
+    total: int
+    page: int
+    page_size: int
 
 
 # ---------- 业务：异动配置 ----------

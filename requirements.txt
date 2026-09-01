@@ -1,5 +1,7 @@
 pandas
+xlrd==2.0.1
 openpyxl
+msoffcrypto-tool
 duckdb
 streamlit
 pytest

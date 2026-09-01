@@ -55,9 +55,10 @@ export function WorkbookUploadPanel({
 
   return (
     <section
+      aria-busy={uploading}
       className={cn(
-        "rounded-xl border bg-white p-4 sm:p-5",
-        isMaster ? "border-sky-200" : "border-slate-200"
+        "rounded-md border bg-white p-4 sm:p-5",
+        isMaster ? "border-teal-200" : "border-slate-200"
       )}
     >
       <div className="flex items-start justify-between gap-4">
@@ -66,7 +67,7 @@ export function WorkbookUploadPanel({
             <span
               className={cn(
                 "inline-flex h-6 min-w-6 items-center justify-center rounded-full px-2 text-xs font-semibold",
-                isMaster ? "bg-sky-100 text-sky-800" : "bg-slate-100 text-slate-700"
+                isMaster ? "bg-teal-700 text-white" : "bg-slate-100 text-slate-700"
               )}
             >
               {isMaster ? "1" : "2"}
@@ -105,26 +106,31 @@ export function WorkbookUploadPanel({
           acceptFiles(event.dataTransfer.files);
         }}
         className={cn(
-          "mt-4 flex min-h-28 w-full items-center justify-center gap-3 rounded-lg border border-dashed px-5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-700 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60",
+          "mt-4 flex min-h-28 w-full items-center justify-center gap-3 rounded-md border border-dashed px-5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-700 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60",
           dragging
-            ? "border-sky-600 bg-sky-50"
+            ? "border-teal-600 bg-teal-50"
             : isMaster
-            ? "border-sky-300 bg-sky-50/50 hover:border-sky-500"
-            : "border-slate-300 bg-slate-50 hover:border-sky-500 hover:bg-sky-50/50"
+            ? "border-teal-300 bg-teal-50/50 hover:border-teal-500"
+            : "border-slate-300 bg-slate-50 hover:border-teal-500 hover:bg-teal-50/50"
         )}
       >
         {uploading ? (
-          <Loader2 className="h-5 w-5 shrink-0 animate-spin text-sky-700" />
+          <Loader2 className="h-5 w-5 shrink-0 animate-spin text-teal-700" />
         ) : (
-          <Upload className="h-5 w-5 shrink-0 text-sky-700" />
+          <Upload className="h-5 w-5 shrink-0 text-teal-700" />
         )}
-        <span>
+        <span aria-live="polite">
           <span className="block text-sm font-medium text-slate-900">
-            {uploading ? (isMaster ? "正在检查、必要时转换并上传…" : "正在检查并上传…") : disabled ? "请先移除当前总表" : helper}
+            {uploading ? "正在上传并检查文件…" : disabled ? "请先移除当前总表" : helper}
           </span>
-          <span className="mt-1 block text-xs text-slate-500">支持 .xlsx / .xls；系统会校验实际文件格式</span>
+          <span className="mt-1 block text-xs text-slate-500">
+            {uploading
+              ? "普通 .xlsx 通常几秒完成；旧版 .xls 最长约 1 分钟"
+              : "支持普通 .xlsx / .xls；加密文件会在上传时弹出密码输入"}
+          </span>
         </span>
       </button>
+
 
       {files.length ? (
         <ul className="mt-3 divide-y divide-slate-100 rounded-lg border border-slate-200 px-3">
