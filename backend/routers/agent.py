@@ -2260,6 +2260,33 @@ def _run_agent_workflow(run_id: str, tenant_id: str) -> None:
 
         plan = run.get("model_plan") or {}
         questions = list(plan.get("questions") or [])
+        month = run.get("month_confirmation", {})
+        # A project/source period mismatch is a business decision, not a
+        # cosmetic filename difference. Stop before expensive model reads.
+        if month.get("required") and not any(
+            "数据源" in str(question) or "source" in str(question).lower()
+            for question in questions
+        ):
+            month_question = (
+                f"当前项目月份为 {run.get('salary_month')}，但上传文件属于 "
+                f"{month.get('filename_month') or '其他月份'} 所属批次。"
+                "请确认本次应按项目月份处理，还是按上传文件所属批次处理；"
+                "若按项目月份处理，请补充对应月份的数据源。"
+            )
+            questions.append(month_question)
+            plan["questions"] = questions
+            run["model_plan"] = plan
+            run.setdefault("plan_confirmation", {})["confirmed"] = False
+            run["status"] = "awaiting_review"
+            run["detail"] = "项目月份与上传数据源批次不一致，等待确认后继续"
+            run.setdefault("workflow", {})["stage"] = "awaiting_input"
+            _append_event(run, "needs_user_input", {
+                "code": "SOURCE_PERIOD_CONFIRMATION_REQUIRED",
+                "detail": run["detail"],
+                "questions": [month_question],
+            })
+            _save_run(run)
+            return
         # The configured project month is the authoritative default. Planning
         # models often restate a filename/month mismatch as a question even
         # when the user has already selected the project period; consume that
@@ -2320,7 +2347,8 @@ def _run_agent_workflow(run_id: str, tenant_id: str) -> None:
             execute_agent_run(run_id, user=user, db=db)
             run = _load_run(run_id, user)
             execution = dict(run.get("execution_result") or {})
-            if execution.get("code") != "MAX_TURNS_EXCEEDED":
+            transient_codes = {"MAX_TURNS_EXCEEDED", "EMPTY_MODEL_RESPONSE", "MODEL_PROVIDER_ERROR"}
+            if execution.get("code") not in transient_codes:
                 break
             if segment >= MAX_AUTOMATIC_MODEL_SEGMENTS:
                 break
@@ -2328,9 +2356,10 @@ def _run_agent_workflow(run_id: str, tenant_id: str) -> None:
             run.setdefault("workflow", {})["segment"] = segment + 1
             _append_event(run, "progress", {
                 "stage": "segment_resume",
-                "label": f"第 {segment} 段模型轮次已完成，正在从已保存的写入进度自动续跑",
+                "label": f"第 {segment} 段模型调用未完成，正在从已保存的写入进度自动续跑",
                 "segment": segment + 1,
                 "estimated_seconds": 90,
+                "reason": execution.get("code"),
             })
             _save_run(run)
         run = _load_run(run_id, user)

@@ -142,6 +142,27 @@ def test_openai_provider_rejects_malformed_tool_arguments(
         provider.complete(messages=[{"role": "user", "content": "继续"}], tools=[])
 
 
+def test_openai_provider_accepts_safe_python_literal_tool_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeepSeek may serialize a JSON object with Python boolean/null spelling."""
+    provider = OpenAICompatibleProvider(ModelConfig(
+        provider="openai_compatible", base_url="https://model.example/v1/",
+        api_key="test-secret", model="finance-model",
+    ))
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda _request: _Response({
+        "choices": [{"message": {"tool_calls": [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "read_range", "arguments": "{'sheet': '工资核算', 'range': 'A1:B2'}"},
+        }]}}],
+    }))
+
+    response = provider.complete(messages=[{"role": "user", "content": "继续"}], tools=[])
+
+    assert response.tool_calls[0].arguments == {"sheet": "工资核算", "range": "A1:B2"}
+
+
 def test_openai_provider_reports_authentication_failures_without_provider_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

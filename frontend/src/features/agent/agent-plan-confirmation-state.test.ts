@@ -18,6 +18,18 @@ test("turns recurring planning questions into explicit choices instead of a free
   assert.ok(questions.every((question) => question.options.length === 2));
 });
 
+test("groups repeated issues into one category choice", () => {
+  const questions = presentPlanQuestions([
+    "考勤!G2 是公式，基础处理器跳过写入",
+    "考勤!I2 是公式，基础处理器跳过写入",
+    "考勤!J2 是公式，基础处理器跳过写入",
+  ]);
+  assert.equal(questions.length, 1);
+  assert.equal(questions[0].title, "考勤数据");
+  assert.match(questions[0].question, /共 3 项/);
+  assert.equal(questions[0].options.length, 2);
+});
+
 test("builds one auditable response from the selected answers", () => {
   const questions = presentPlanQuestions(["当前master文件名为202607，而本次指令指定salary_month为2026.08。请确认处理月份。"], "2026.08");
   const instruction = buildPlanResponse(questions, { [questions[0].id]: "use_project_month" }, "仅处理来源中有记录的人员");

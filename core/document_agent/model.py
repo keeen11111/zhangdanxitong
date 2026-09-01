@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import ast
 import time
 import urllib.error
 import urllib.request
@@ -159,6 +160,36 @@ class OpenAICompatibleProvider:
         if config.provider != "openai_compatible":
             raise ValueError("unsupported model provider")
         self.config = config
+
+    @staticmethod
+    def _decode_tool_arguments(value: Any) -> dict[str, Any]:
+        """Decode provider arguments with syntax-only recovery.
+
+        Some compatible endpoints serialize a JSON object using Python literal
+        spelling (single quotes/True/None), or wrap valid JSON in a markdown
+        fence. ``literal_eval`` is deliberately limited to literals and the
+        result is still required to be an object; no missing fields are guessed.
+        """
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            raise ValueError
+        text = value.strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(lines[1:-1]).strip()
+            if text.lower().startswith("json\n"):
+                text = text[5:].lstrip()
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            try:
+                parsed = ast.literal_eval(text)
+            except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+                raise ValueError from None
+        if not isinstance(parsed, dict):
+            raise ValueError
+        return parsed
 
     def complete(
         self,
@@ -413,11 +444,7 @@ class OpenAICompatibleProvider:
                 raise ModelProviderError("模型 Responses 输出结构无效")
             if output.get("type") == "function_call":
                 try:
-                    arguments = output.get("arguments", {})
-                    if isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    if not isinstance(arguments, dict):
-                        raise ValueError
+                    arguments = self._decode_tool_arguments(output.get("arguments", {}))
                     calls.append(ToolCall(
                         call_id=str(output.get("call_id") or output.get("id") or "call-unknown"),
                         name=output.get("name"), arguments=arguments,
@@ -462,11 +489,7 @@ class OpenAICompatibleProvider:
                 function = raw_call.get("function")
                 if not isinstance(function, dict):
                     raise ValueError
-                arguments = function.get("arguments", {})
-                if isinstance(arguments, str):
-                    arguments = json.loads(arguments)
-                if not isinstance(arguments, dict):
-                    raise ValueError
+                arguments = self._decode_tool_arguments(function.get("arguments", {}))
                 calls.append(ToolCall(
                     call_id=str(raw_call.get("id") or "call-unknown"),
                     name=function.get("name"),

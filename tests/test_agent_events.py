@@ -588,3 +588,50 @@ def test_background_workflow_keeps_resuming_past_the_legacy_six_segment_limit(tm
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
     assert calls == 8
     assert completed["status"] == "completed"
+
+
+def test_background_workflow_retries_transient_model_provider_error(tmp_path, monkeypatch) -> None:
+    run_id = "e2" * 16
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    monkeypatch.setattr(agent, "_material_context", lambda _run: [])
+
+    class FakeDb:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(agent, "SessionLocal", FakeDb)
+    agent._save_run({
+        "run_id": run_id, "tenant_id": "tenant-a", "project_id": "project-a",
+        "status": "planning", "instruction": "更新", "events": [], "items": [],
+        "model_plan": {"summary": "计划", "steps": ["写入"], "questions": []},
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "month_confirmation": {"required": False, "confirmed": True},
+    })
+    calls = 0
+
+    def fake_execute(current_run_id, user, db):
+        nonlocal calls
+        calls += 1
+        current = agent._load_run(current_run_id, user)
+        if calls == 1:
+            current.update({
+                "status": "execution_incomplete",
+                "execution_result": {"status": "execution_incomplete", "code": "MODEL_PROVIDER_ERROR"},
+            })
+        else:
+            current.update({
+                "status": "completed",
+                "execution_result": {"status": "completed", "content": "完成"},
+                "workbook_updates": [{"sheet": "工资核算", "cell": "A1"}],
+            })
+        agent._save_run(current)
+        return agent._public_run(current)
+
+    monkeypatch.setattr(agent, "execute_agent_run", fake_execute)
+    agent._run_agent_workflow(run_id, "tenant-a")
+
+    completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
+    assert calls == 2
+    assert completed["status"] == "completed"
+    assert any(event.get("payload", {}).get("reason") == "MODEL_PROVIDER_ERROR" for event in completed["events"])

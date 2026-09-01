@@ -93,6 +93,7 @@ export interface AgentRun {
   plan_confirmation?: { required: boolean; confirmed: boolean };
   file_manifest?: Array<{ filename: string; role: string; sha256: string }>;
   model_plan?: { summary: string; steps: string[]; questions: string[]; model: string };
+  basic_processor?: { status?: string; change_count?: number; issue_count?: number; issues?: Array<{ item?: string; detail?: string }> } | null;
   run_id: string;
   project_id: string;
   company_id?: string | null;
@@ -108,7 +109,7 @@ export interface AgentRun {
   created_at?: string;
   updated_at?: string;
   detail?: string | null;
-  month_confirmation?: { required: boolean; confirmed: boolean };
+  month_confirmation?: { required: boolean; confirmed: boolean; filename_month?: string; configured_month?: string };
   conversation?: AgentMessage[];
 }
 

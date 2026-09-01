@@ -157,6 +157,19 @@ class ModelOrchestrator:
                     response: ModelResponse = provider.complete(messages=request_messages, tools=tools or [])
                 except ModelProviderError as exc:
                     last_provider_error = str(exc).strip() or "模型服务请求失败"
+                    if "HTTP 400" in last_provider_error and attempt < MODEL_RESPONSE_RETRY_LIMIT:
+                        # A compatible endpoint may reject an oversized or
+                        # malformed accumulated tool transcript. Persisted
+                        # workbook writes are authoritative, so retry from the
+                        # original task context with a compact continuation
+                        # message instead of replaying the whole transcript.
+                        request_messages = [
+                            *initial_messages,
+                            {
+                                "role": "user",
+                                "content": "上一轮请求被模型服务拒绝（HTTP 400）。请从工作簿当前已保存进度继续，仅调用一个符合工具 schema 的受控工具；不要重复已完成写入。",
+                            },
+                        ]
                     if "工具调用参数无效" in last_provider_error and attempt < MODEL_RESPONSE_RETRY_LIMIT:
                         # DeepSeek occasionally emits a malformed tool call.
                         # Keep the same conversation but explicitly request a
@@ -215,6 +228,22 @@ class ModelOrchestrator:
                 ))
                 if response.content.strip() or response.tool_calls:
                     break
+                # An empty response is commonly caused by the provider
+                # exhausting context/reasoning budget.  Retrying the full
+                # tool transcript only reproduces that condition and makes a
+                # run appear stuck.  Workbook writes are already durable, so
+                # retry from the original task with a compact continuation.
+                if attempt < MODEL_RESPONSE_RETRY_LIMIT:
+                    request_messages = [
+                        *initial_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "上一轮模型返回空响应。请从工作簿当前已保存进度继续，"
+                                "只调用一个符合工具 schema 的受控工具；不要重复已完成写入。"
+                            ),
+                        },
+                    ]
                 if attempt == MODEL_RESPONSE_RETRY_LIMIT:
                     if provider_index + 1 < len(providers):
                         provider_index += 1
@@ -246,13 +275,6 @@ class ModelOrchestrator:
                         content=content,
                         events=events,
                     )
-                request_messages = [
-                    *conversation,
-                    {
-                        "role": "user",
-                        "content": "上一响应为空。请从当前进度继续调用受控工具，或明确说明尚未完成的事项。",
-                    },
-                ]
             if switched_provider:
                 continue
             content = response.content

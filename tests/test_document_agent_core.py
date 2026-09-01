@@ -292,6 +292,28 @@ def test_orchestrator_marks_persistent_empty_responses_as_resumable() -> None:
     assert result.code == "EMPTY_MODEL_RESPONSE"
 
 
+def test_orchestrator_compacts_context_after_empty_response() -> None:
+    requests = []
+
+    class Provider:
+        def complete(self, *, messages, tools):
+            requests.append(messages)
+            if len(requests) == 1:
+                return ModelResponse()
+            return ModelResponse(content="已从保存进度继续")
+
+    result = ModelOrchestrator(provider=Provider()).run(
+        run_id="run-1",
+        messages=[{"role": "user", "content": "处理项目"}],
+        tools=[],
+    )
+
+    assert result.status == "completed"
+    assert len(requests) == 2
+    assert len(requests[1]) == 2
+    assert "当前已保存进度" in requests[1][-1]["content"]
+
+
 def test_orchestrator_marks_persistent_provider_errors_as_resumable() -> None:
     class UnavailableProvider:
         def complete(self, *, messages, tools):
@@ -303,6 +325,26 @@ def test_orchestrator_marks_persistent_provider_errors_as_resumable() -> None:
 
     assert result.status == "execution_incomplete"
     assert result.code == "MODEL_PROVIDER_ERROR"
+
+
+def test_orchestrator_compacts_context_after_http_400_and_retries_same_provider() -> None:
+    requests = []
+
+    class Provider:
+        def complete(self, *, messages, tools):
+            requests.append(messages)
+            if len(requests) == 1:
+                raise ModelProviderError("模型服务请求失败（HTTP 400）")
+            return ModelResponse(content="已从保存进度继续")
+
+    result = ModelOrchestrator(provider=Provider()).run(
+        run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[]
+    )
+
+    assert result.status == "completed"
+    assert len(requests) == 2
+    assert len(requests[1]) == 2
+    assert "HTTP 400" in requests[1][-1]["content"]
 
 
 def test_orchestrator_preserves_actionable_provider_error_details() -> None:
