@@ -57,7 +57,7 @@ class ToolRegistry:
             "match_person", "propose_changes", "apply_cell_changes",
             "select_sheet_mapping",
             "copy_formula_from_reference", "validate_workbook", "rollback_work_item",
-            "publish_workbook",
+            "validate_with_officecli", "publish_workbook",
         }:
             raise ValueError(f"unsupported tool: {name}")
         self._handlers[name] = handler

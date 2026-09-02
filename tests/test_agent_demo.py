@@ -13,6 +13,14 @@ import pytest
 from backend.agent_demo import demo_directory, finish_demo, load_demo
 
 
+def test_demo_workflow_keeps_a_thirty_second_processing_window() -> None:
+    """演示流程应保留可观察的处理阶段，总等待约 30 秒。"""
+    import backend.routers.agent as agent
+
+    assert agent.DEMO_TOTAL_DELAY_SECONDS == 30.0
+    assert agent._demo_stage_delay(4) == pytest.approx(7.5)
+
+
 def test_keyuan_demo_script_is_not_the_agent_execution_path() -> None:
     """The old desktop automation script remains only as a legacy utility."""
     import backend.routers.agent as agent

@@ -49,6 +49,52 @@ def test_every_advertised_tool_survives_typed_registry_round_trip(
     assert ToolResult.model_validate_json(result.model_dump_json()) == result
 
 
+def test_officecli_validation_tool_is_exposed_without_command_arguments() -> None:
+    schema = next(
+        item for item in _model_tool_schemas()
+        if item["function"]["name"] == "validate_with_officecli"
+    )
+    assert schema["function"]["parameters"] == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+
+def test_officecli_validation_is_scoped_to_the_current_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft = tmp_path / "draft.xlsx"
+    draft.write_bytes(b"placeholder")
+    captured: dict[str, Any] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "workbook is valid"
+        stderr = ""
+
+    def fake_run(args: list[str], **kwargs: Any) -> Completed:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setattr("backend.routers.agent.subprocess.run", fake_run)
+    registry = _build_run_tool_registry({
+        "run_id": "run-1", "project_id": "project-1", "draft_filename": draft.name,
+        "items": [],
+    }, workbook_path=draft)
+
+    result = registry.execute(ToolCall(
+        call_id="officecli", name="validate_with_officecli", arguments={},
+    ))
+
+    assert result.ok is True
+    assert result.output["valid"] is True
+    assert Path(captured["args"][-1]) == draft
+    assert captured["kwargs"]["shell"] is False
+
+
 @pytest.mark.parametrize("name", ["inspect_source_file", "read_source_range"])
 def test_advertised_source_tools_read_the_registered_run_source(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

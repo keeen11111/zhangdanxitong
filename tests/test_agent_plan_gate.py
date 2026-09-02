@@ -476,6 +476,29 @@ def test_basic_source_detection_accepts_generic_monthly_filename(tmp_path: Path)
     assert detected == ("更新表-2026-08.xlsx", source)
 
 
+def test_basic_source_detection_prefers_salary_workbook_over_tax_attachment(tmp_path: Path) -> None:
+    from backend.agent_execution import find_basic_salary_source
+
+    # Upload normalization keeps the original .xls name but stores an .xlsx path.
+    tax = tmp_path / "tax-upload.xlsx"
+    tax_book = openpyxl.Workbook()
+    tax_book.active.title = "个税导出核对"
+    tax_book.save(tax)
+    tax_book.close()
+
+    salary = tmp_path / "薪资数据-科园-7月薪资（8.14发薪）.xlsx"
+    salary_book = openpyxl.Workbook()
+    salary_book.active.title = "奖金-7月"
+    salary_book.create_sheet("考勤-7月")
+    salary_book.create_sheet("值班")
+    salary_book.save(salary)
+    salary_book.close()
+
+    detected = find_basic_salary_source({"202608_税款计算_工资薪金所得-益药科园.xls": str(tax), salary.name: str(salary)})
+
+    assert detected == (salary.name, salary)
+
+
 def test_basic_processor_runs_before_model_configuration_gate(
     scenario: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -541,6 +564,61 @@ def test_background_workflow_runs_preflight_before_model_planning(
     assert run["status"] == "blocked"
     assert run["code"] == "MODEL_CONFIGURATION_REQUIRED"
     assert "基础 Python 更新已完成" in run["detail"]
+
+
+def test_background_workflow_does_not_finish_after_mixed_preflight_updates(
+    scenario: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Formula preservation issues must not hide real source-data writes."""
+    run = _prepared_run(scenario)
+    run["status"] = "planning"
+
+    monkeypatch.setattr(agent, "_load_run", lambda *_args, **_kwargs: run)
+    monkeypatch.setattr(agent, "_save_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent, "_material_context", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(agent, "_rule_package_context", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(agent, "SessionLocal", lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(agent, "_release_run_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent.ModelConfig, "from_env", lambda: None)
+    monkeypatch.setattr(agent.ModelConfig, "fallback_from_env", lambda: None)
+    monkeypatch.setattr(
+        agent,
+        "find_basic_salary_source",
+        lambda _paths: ("奖金来源.xlsx", Path(run["_source_paths"]["奖金来源.xlsx"])),
+    )
+
+    def fake_preflight(current_run: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        current_run["basic_processor"] = {
+            "status": "needs_review",
+            "change_count": 1,
+            "issue_count": 1,
+            "issues": [{"item": "考勤!G2", "detail": "目标单元格是公式，基础处理器跳过写入"}],
+        }
+        current_run["preflight_draft_filename"] = "Agent草稿.xlsx"
+        return current_run["basic_processor"]
+
+    monkeypatch.setattr(agent, "run_basic_preflight", fake_preflight)
+
+    agent._run_agent_workflow(run["run_id"], "tenant-a")
+
+    assert run["status"] == "blocked"
+    assert run["code"] == "MODEL_CONFIGURATION_REQUIRED"
+    assert "基础 Python 更新已完成" in run["detail"]
+    assert run.get("execution_result", {}).get("code") != "DETERMINISTIC_FORMULA_PRESERVED"
+
+
+def test_public_run_recovers_legacy_month_only_completion(scenario: SimpleNamespace) -> None:
+    run = {
+        "run_id": "legacy-mixed", "tenant_id": "tenant-a", "project_id": "project-1",
+        "status": "completed", "items": [], "workbook_updates": [{"sheet": "工资核算", "cell": "AE4"}],
+        "basic_processor": {"change_count": 1, "issue_count": 1, "issues": [{"detail": "目标单元格是公式，基础处理器跳过写入"}]},
+        "execution_result": {"status": "completed", "code": "DETERMINISTIC_FORMULA_PRESERVED"},
+    }
+    assert agent._recover_incomplete_formula_completion(run) is True
+    assert run["status"] == "execution_incomplete"
+    assert run["code"] == "INCOMPLETE_DATA_PROCESSING"
+    assert run["plan_confirmation"]["confirmed"] is True
+    assert run["month_confirmation"]["confirmed"] is True
 
 
 def test_model_prose_without_write_tool_calls_never_creates_or_approves_a_draft(

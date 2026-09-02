@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime
 import json
 
 import openpyxl
@@ -136,4 +137,160 @@ def test_basic_processor_accepts_a_different_month_sheet_suffix(tmp_path: Path) 
     output = openpyxl.load_workbook(tmp_path / "processed.xlsx", data_only=False)
     assert output["工资核算"].cell(4, 30).value == 100
     assert output["考勤"].cell(2, 7).value == 22
+    output.close()
+
+
+def test_basic_processor_rolls_oa_history_down_and_adds_july(tmp_path: Path) -> None:
+    from scripts.keyuan_basic_processor import process_keyuan_basics
+
+    master_path = tmp_path / "master.xlsx"
+    master = openpyxl.Workbook()
+    master.active.title = "工资核算"
+    master.create_sheet("考勤")
+    master.create_sheet("配送员值班费")
+    master.create_sheet("其他调差累计")
+    oa = master.create_sheet("OA请款及审批")
+    for row, month in enumerate(("6月", "5月", "4月"), start=8):
+        oa.cell(row, 1).value = month
+        oa.cell(row, 2).value = f"value-{month}"
+    # The current-month row uses formulas; history must snapshot its value
+    # instead of inheriting the formula and following the new July total.
+    oa["C8"] = "=C5"
+    oa["C5"] = 100
+    master.save(master_path)
+    master.close()
+
+    source_path = tmp_path / "salary.xlsx"
+    source = openpyxl.Workbook()
+    source.active.title = "奖金-7月"
+    source.create_sheet("考勤-7月")
+    source.create_sheet("值班")
+    source.create_sheet("补发补扣")
+    source.save(source_path)
+    source.close()
+
+    output_path = tmp_path / "processed.xlsx"
+    result = process_keyuan_basics(master_path, source_path, output_path)
+
+    workbook = openpyxl.load_workbook(output_path, data_only=False)
+    oa = workbook["OA请款及审批"]
+    assert oa["A8"].value == "7月"
+    assert oa["A9"].value == "6月"
+    assert oa["A10"].value == "5月"
+    assert oa["A11"].value == "4月"
+    assert oa["B9"].value == "value-6月"
+    assert oa["C8"].value == "=C5"
+    assert oa["C9"].value != "=C5"
+    assert any(change["rule"] == "OA新增7月" for change in result["changes"])
+    workbook.close()
+
+
+def test_basic_processor_merges_all_mapped_salary_sheets(tmp_path: Path) -> None:
+    from scripts.keyuan_basic_processor import process_keyuan_basics
+
+    master_path = tmp_path / "master.xlsx"
+    master = openpyxl.Workbook()
+    payroll = master.active
+    payroll.title = "工资核算"
+    payroll.cell(4, 2).value = "李文慧"
+    payroll.cell(4, 17).value = "3000/年"
+    attendance = master.create_sheet("考勤")
+    attendance.cell(2, 2).value = "李楠"
+    attendance.cell(2, 11).value = 9
+    attendance.cell(2, 17).value = "常白班"
+    duty = master.create_sheet("配送员值班费")
+    duty.cell(2, 2).value = "李文慧"
+    adjustment = master.create_sheet("其他调差累计")
+    personnel = master.create_sheet("人员异动")
+    personnel.append(["入职情况："])
+    personnel.append(["序号", "姓 名", "员工工号", "部门", "组别", "职 务", "人员类别", "入职日期", "试用结束日期"])
+    personnel.append([1, "李楠", "002056", "北京益药科园大药房有限公司", "北京门店", "收银员", "合同制人员", datetime(2026, 5, 12), datetime(2026, 11, 11)])
+    personnel.append([None] * 9)
+    personnel.append(["离职情况:"])
+    personnel.append(["序号", "姓名", "员工工号", "部门", "组别", "职务", "人员类别", "入职日期", "离职日期", "离职原因"])
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append(["内部调动:"])
+    personnel.append(["序号", "姓 名", "员工编号", "调出部门", "原组别", "原职务", "调入部门", "现组别", "现职务", "生效日期"])
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    personnel.append([None] * 10)
+    heat = master.create_sheet("防暑降温费")
+    heat.cell(2, 2).value = "李楠"
+    heat.cell(2, 10).value = "旧标准"
+    master.save(master_path)
+    master.close()
+
+    source_path = tmp_path / "薪资数据-科园-7月薪资.xlsx"
+    source = openpyxl.Workbook()
+    source.active.title = "奖金-7月"
+    source.create_sheet("考勤-7月")
+    source.create_sheet("值班")
+    source.create_sheet("补发补扣")
+    transfer = source.create_sheet("入离职、转岗、转正、其他")
+    transfer.append(["入职"])
+    transfer.append(["姓名", "新工号", "新公司", "新成本中心/部门", "入职时间", "试用期结束时间", "岗位"])
+    transfer.append(["李楠", "002228", "北京益药科园大药房有限公司", "北京大药房", datetime(2026, 5, 12), datetime(2026, 11, 11), "收银员"])
+    transfer.append([None])
+    transfer.append(["内部调动"])
+    transfer.append(["序号", "姓 名", "员工编号", "调出部门", "原组别", "原职务", "调入部门", "现组别", "现职务", "生效日期", "月薪"])
+    transfer.append([1, "李文慧", None, "客服组", None, "患者服务负责人", "客服组", None, "CAR-T执业药师", datetime(2026, 7, 1), 1050])
+    high_temp = source.create_sheet("高温费")
+    high_temp.append(["人员", "高温费（元/年）"])
+    high_temp.append(["李楠", 1200])
+    benefits = source.create_sheet("年节福利")
+    benefits.append(["人员", "年节费（元/年）"])
+    benefits.append(["李文慧", 0])
+    work_cycle = source.create_sheet("科园做一休一人员")
+    work_cycle.append(["李楠"])
+    ignored = source.create_sheet("迟到早退旷工")
+    ignored.append(["迟到"])
+    ignored.append(["姓名", "迟到次数（求和）", None, None, None, "豁免"])
+    ignored.append(["李楠", 3, None, None, None, "豁免"])
+    source.save(source_path)
+    source.close()
+
+    output_path = tmp_path / "processed.xlsx"
+    result = process_keyuan_basics(master_path, source_path, output_path)
+
+    output = openpyxl.load_workbook(output_path, data_only=False)
+    assert output["人员异动"]["C3"].value == "002228"
+    assert output["工资核算"]["Y4"].value == 1050
+    assert output["工资核算"]["AA4"].value == 1050
+    assert output["工资核算"]["Q4"].value == "0/年"
+    assert output["考勤"]["Q2"].value == "上一休一"
+    assert output["考勤"]["K2"].value == 9
+    assert output["防暑降温费"]["J2"].value == 1200
+    assert any(change["rule"] in {"入职", "内部调动", "离职", "跨公司调动", "其他"} for change in result["changes"])
     output.close()

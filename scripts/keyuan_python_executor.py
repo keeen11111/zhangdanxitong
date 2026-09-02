@@ -69,6 +69,162 @@ def _set(changes: list[dict[str, Any]], sheet: Any, row: int, col: int, value: A
     changes.append({"sheet": sheet.title, "cell": cell.coordinate, "before": before, "after": value, "source": source, "rule": rule})
 
 
+def _apply_personnel_changes(
+    target: Any,
+    source: Any,
+    changes: list[dict[str, Any]],
+    issues: list[dict[str, str]],
+    source_name: str,
+) -> None:
+    """Merge the monthly personnel-change blocks into the template's reserved rows.
+
+    The source workbook is a compact report with four labelled blocks, while the
+    master keeps historical rows and blank rows before the next block.  We append
+    only records whose stable identity (name, id/date where available) is absent,
+    preserving existing history and making the operation idempotent.
+    """
+    def clean(value: Any) -> Any:
+        return None if value in (None, "", "无", "无变化") else value
+
+    def row_values(row: int, width: int) -> list[Any]:
+        return [clean(source.cell(row, col).value) for col in range(1, width + 1)]
+
+    def find_block(label: str) -> tuple[int, int] | None:
+        for row in range(1, source.max_row + 1):
+            if norm(source.cell(row, 1).value) == norm(label):
+                return row, row + 1
+        return None
+
+    def data_rows(header_row: int, width: int) -> list[list[Any]]:
+        rows: list[list[Any]] = []
+        for row in range(header_row + 1, source.max_row + 1):
+            first = clean(source.cell(row, 1).value)
+            if first is None:
+                continue
+            if norm(first) in {"入职", "离职、退休", "试用期转正", "内部调动", "夸公司调动", "跨公司调动", "其他", "劳动合同变更"}:
+                break
+            values = row_values(row, width)
+            if any(value is not None for value in values):
+                rows.append(values)
+        return rows
+
+    def append_rows(
+        rows: list[list[Any]],
+        start_row: int,
+        end_row: int,
+        width: int,
+        mapping: list[int | None],
+        key_columns: tuple[int, ...],
+        rule: str,
+    ) -> None:
+        existing: set[tuple[str, ...]] = set()
+        for row in range(start_row, end_row + 1):
+            key = tuple(norm(target.cell(row, col).value) for col in key_columns)
+            if any(key):
+                existing.add(key)
+        next_row = start_row
+        for row in range(start_row, end_row + 1):
+            if any(target.cell(row, col).value not in (None, "") for col in range(1, width + 1)):
+                next_row = row + 1
+        for values in rows:
+            mapped = [values[idx] if idx is not None and idx < len(values) else None for idx in mapping]
+            # Some monthly reports omit the employee number for internal moves;
+            # recover it from the historical movement rows by name.
+            if rule == "内部调动" and mapped[2] is None and mapped[1] is not None:
+                for prior in range(1, target.max_row + 1):
+                    if norm(target.cell(prior, 2).value) == norm(mapped[1]) and target.cell(prior, 3).value not in (None, ""):
+                        mapped[2] = target.cell(prior, 3).value
+                        break
+            key = tuple(norm(mapped[col - 1]) for col in key_columns)
+            if not any(key):
+                continue
+            if key in existing:
+                # A monthly report is authoritative for an existing identity:
+                # reconcile changed fields (for example a corrected employee
+                # number) without appending a duplicate historical row.
+                for prior in range(start_row, end_row + 1):
+                    prior_key = tuple(norm(target.cell(prior, col).value) for col in key_columns)
+                    if prior_key == key:
+                        for col, value in enumerate(mapped, 1):
+                            if col == 1:
+                                continue
+                            if value is not None:
+                                _set(changes, target, prior, col, value, source_name, rule)
+                        break
+                continue
+            while next_row <= end_row and any(target.cell(next_row, col).value not in (None, "") for col in range(1, width + 1)):
+                next_row += 1
+            if next_row > end_row:
+                issues.append({"item": "人员异动", "detail": f"{rule}预留行不足，无法写入：{mapped[1] if len(mapped) > 1 else mapped[0]}"})
+                continue
+            # Copy the preceding row's formatting so appended history matches the template.
+            if next_row > start_row:
+                for col in range(1, width + 1):
+                    copy_cell(target.cell(next_row - 1, col), target.cell(next_row, col))
+                if next_row - 1 in target.row_dimensions:
+                    target.row_dimensions[next_row] = copy(target.row_dimensions[next_row - 1])
+            seq = max([number(target.cell(r, 1).value) for r in range(start_row, next_row) if parsed_number(target.cell(r, 1).value) is not None] or [0]) + 1
+            mapped[0] = int(seq)
+            for col, value in enumerate(mapped, 1):
+                if value is not None:
+                    _set(changes, target, next_row, col, value, source_name, rule)
+            existing.add(key)
+            next_row += 1
+
+    # New hires and departures use the same historical employee blocks.  The
+    # monthly source often repeats rows already present in the master, so keys
+    # include the effective date to keep the merge idempotent.
+    block = find_block("入职")
+    if block:
+        rows = data_rows(block[1], 18)
+        append_rows(rows, 3, 24, 9, [None, 0, 1, 2, 3, 6, None, 4, 5], (2, 8), "入职")
+
+    block = find_block("离职、退休")
+    if block:
+        rows = data_rows(block[1], 3)
+        hire_info: dict[str, list[Any]] = {}
+        for row in range(3, 25):
+            name = norm(target.cell(row, 2).value)
+            if name:
+                hire_info[name] = [target.cell(row, col).value for col in (3, 4, 5, 6, 7, 8)]
+        exit_rows: list[list[Any]] = []
+        for values in rows:
+            name, leave_date, reason = (values + [None, None, None])[:3]
+            candidates = [row for row in range(27, 64) if norm(target.cell(row, 2).value) == norm(name)]
+            if candidates and len(candidates) == 1:
+                # Existing rows sometimes contain a malformed date string (for
+                # example ``20256-5-31``); the monthly report is authoritative.
+                prior = candidates[0]
+                _set(changes, target, prior, 9, leave_date, source_name, "离职")
+                _set(changes, target, prior, 10, reason, source_name, "离职")
+                continue
+            info = hire_info.get(norm(name), [None] * 6)
+            if not norm(name):
+                continue
+            exit_rows.append([None, name, *info, leave_date, reason])
+            if not any(info):
+                issues.append({"item": "人员异动", "detail": f"离职人员未在入职区匹配：{name}"})
+        append_rows(exit_rows, 27, 63, 10, list(range(10)), (2,), "离职")
+
+    block = find_block("内部调动")
+    if block:
+        rows = data_rows(block[1], 10)
+        append_rows(rows, 81, 99, 10, list(range(10)), (2, 3, 10), "内部调动")
+
+    block = find_block("夸公司调动") or find_block("跨公司调动")
+    if block:
+        rows = data_rows(block[1], 17)
+        # Source: name, new id, old company, new company, cost centre, join,
+        # transfer date, position.  Target uses the compact cross-company layout.
+        append_rows(rows, 102, 105, 10, [None, 0, 1, 2, 4, None, 3, 7, 6, None], (2, 3, 9), "跨公司调动")
+
+    block = find_block("其他")
+    if block:
+        rows = data_rows(block[1], 2)
+        # The master has two blank rows immediately before the contract-change block.
+        append_rows(rows, 148, 149, 10, [None, 0, 1, None, None, None, None, None, None, None], (2,), "其他")
+
+
 def _copy_row(
     sheet: Any,
     source_row: int,
@@ -84,6 +240,37 @@ def _copy_row(
         copy_cell(source, target)
     if source_row in sheet.row_dimensions:
         sheet.row_dimensions[target_row] = copy(sheet.row_dimensions[source_row])
+
+
+def _restore_template_layout(book: Any, template: Any) -> None:
+    """Keep formatted blank rows/columns and print layout from the template."""
+    for name in template.sheetnames:
+        if name not in book.sheetnames:
+            continue
+        target, source = book[name], template[name]
+        for key, dim in source.row_dimensions.items():
+            target.row_dimensions[key] = copy(dim)
+        for key, dim in source.column_dimensions.items():
+            target.column_dimensions[key] = copy(dim)
+        for merged in source.merged_cells.ranges:
+            if str(merged) not in {str(item) for item in target.merged_cells.ranges}:
+                try:
+                    target.merge_cells(str(merged))
+                except (ValueError, KeyError):
+                    pass
+        target.sheet_format = copy(source.sheet_format)
+        target.sheet_properties = copy(source.sheet_properties)
+        target.page_margins = copy(source.page_margins)
+        target.page_setup = copy(source.page_setup)
+        target.print_options = copy(source.print_options)
+        target.freeze_panes = source.freeze_panes
+        # openpyxl drops styled empty cells on save; restore those cells only
+        # when the processed workbook still has no value in them.
+        for row in source.iter_rows():
+            for src_cell in row:
+                dst_cell = target[src_cell.coordinate]
+                if dst_cell.value is None and src_cell.has_style:
+                    copy_cell(src_cell, dst_cell)
 
 
 def _read_book(path: Path) -> openpyxl.Workbook:
@@ -182,8 +369,10 @@ def process_keyuan_python(
     salary_name = Path(salary_path).name
     try:
         payroll = book["工资核算"]
-        payroll.insert_cols(1)
-        _set(changes, payroll, 2, 1, "班制", "操作手册", "新增班制列")
+        inserted_class_column = norm(payroll.cell(2, 1).value) != "班制"
+        if inserted_class_column:
+            payroll.insert_cols(1)
+            _set(changes, payroll, 2, 1, "班制", "操作手册", "新增班制列")
         for row in range(4, 44):
             for col, formula in _formula_map(row).items():
                 existing = payroll.cell(row, col).value
@@ -204,27 +393,29 @@ def process_keyuan_python(
             _set(changes, payroll, row, 95, None, "操作手册", "清除未提供的外部公式")
             _set(changes, payroll, row, 96, None, "操作手册", "清除未提供的外部公式")
 
-        for col in range(2, payroll.max_column + 1):
-            cell = payroll.cell(44, col)
-            if isinstance(cell.value, str) and cell.value.startswith("="):
-                translated = Translator(
-                    cell.value,
-                    origin=f"{get_column_letter(col - 1)}44",
-                ).translate_formula(cell.coordinate)
-                _set(changes, payroll, 44, col, translated, "工资核算模板", "插列后恢复合计公式")
+        if inserted_class_column:
+            for col in range(2, payroll.max_column + 1):
+                cell = payroll.cell(44, col)
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    translated = Translator(
+                        cell.value,
+                        origin=f"{get_column_letter(col - 1)}44",
+                    ).translate_formula(cell.coordinate)
+                    _set(changes, payroll, 44, col, translated, "工资核算模板", "插列后恢复合计公式")
         _set(changes, payroll, 49, 70, "=BB44+BJ44+BK44+BL44+BM44+BO44", "工资核算模板", "恢复工资核算汇总公式")
         for col in (54, 62, 63, 64, 65, 66, 67):
             letter = get_column_letter(col)
             _set(changes, payroll, 50, col, f"=SUBTOTAL(9,{letter}4:{letter}43)", "工资核算模板", "恢复工资核算分项合计")
         _set(changes, payroll, 51, 67, "=BO50+BM50+BL50+BK50+BJ50+BB50", "工资核算模板", "恢复工资核算合计")
 
-        for row in range(4, 44):
-            cell = payroll.cell(row, 91)
-            if isinstance(cell.value, ArrayFormula):
-                translated = Translator(cell.value.text, origin=cell.value.ref).translate_formula(cell.coordinate)
-                before = (cell.value.text, cell.value.ref)
-                cell.value = ArrayFormula(ref=cell.coordinate, text=translated)
-                changes.append({"sheet": payroll.title, "cell": cell.coordinate, "before": before, "after": (translated, cell.coordinate), "source": "工资核算模板", "rule": "插列后平移数组公式"})
+        if inserted_class_column:
+            for row in range(4, 44):
+                cell = payroll.cell(row, 91)
+                if isinstance(cell.value, ArrayFormula):
+                    translated = Translator(cell.value.text, origin=cell.value.ref).translate_formula(cell.coordinate)
+                    before = (cell.value.text, cell.value.ref)
+                    cell.value = ArrayFormula(ref=cell.coordinate, text=translated)
+                    changes.append({"sheet": payroll.title, "cell": cell.coordinate, "before": before, "after": (translated, cell.coordinate), "source": "工资核算模板", "rule": "插列后平移数组公式"})
 
         bonus = next((salary[name] for name in salary.sheetnames if name.startswith("奖金-")), None)
         if bonus:
@@ -307,6 +498,11 @@ def process_keyuan_python(
                 _set(changes, adjustment, output_row, 3, note, salary_name, "补发补扣")
                 output_row += 1
 
+        # Merge monthly personnel movements into the historical movement ledger.
+        personnel_source = next((salary[name] for name in salary.sheetnames if "入离职" in name or "转岗" in name), None)
+        if personnel_source is not None and "人员异动" in book.sheetnames:
+            _apply_personnel_changes(book["人员异动"], personnel_source, changes, issues, salary_name)
+
         heat = book["防暑降温费"]
         _set(changes, heat, 1, 11, 23, "操作手册", "当月应出勤23天")
         for row in range(4, 44):
@@ -327,15 +523,16 @@ def process_keyuan_python(
         _set(changes, payslip, 45, 1, "累计工资条", "原始总表", "沉淀上月工资条")
 
         oa = book["OA请款及审批"]
-        for row in range(13, 7, -1):
-            _copy_row(
-                oa,
-                row,
-                row + 1,
-                min(11, oa.max_column),
-                value_sheet=cached_master["OA请款及审批"] if row == 8 else None,
-            )
-        _set(changes, oa, 8, 1, "7月", "操作手册", "OA新增当月记录")
+        if norm(oa.cell(8, 1).value) != "7月":
+            for row in range(13, 7, -1):
+                _copy_row(
+                    oa,
+                    row,
+                    row + 1,
+                    min(11, oa.max_column),
+                    value_sheet=cached_master["OA请款及审批"] if row == 8 else None,
+                )
+            _set(changes, oa, 8, 1, "7月", "操作手册", "OA新增当月记录")
 
         # Rebuild the two external-data sheets by stable headers/identity.
         ledger = book["台账"]
@@ -413,6 +610,7 @@ def process_keyuan_python(
         book.calculation.fullCalcOnLoad = True
         book.calculation.forceFullCalc = True
         book.calculation.calcMode = "auto"
+        _restore_template_layout(book, cached_master)
         book.save(output_path)
     finally:
         salary.close()

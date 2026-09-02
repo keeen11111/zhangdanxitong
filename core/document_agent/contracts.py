@@ -18,7 +18,7 @@ ToolName = Literal[
     "inspect_source_file", "read_source_range",
     "match_person", "propose_changes", "apply_cell_changes",
     "select_sheet_mapping",
-    "copy_formula_from_reference", "validate_workbook", "rollback_work_item",
+    "copy_formula_from_reference", "validate_workbook", "validate_with_officecli", "rollback_work_item",
     "publish_workbook",
 ]
 ToolCallStatus = Literal["pending", "running", "succeeded", "failed"]

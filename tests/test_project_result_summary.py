@@ -70,3 +70,34 @@ def test_project_result_summary_includes_a_generic_financial_draft(tmp_path, mon
         "result_completed_at": "2026-08-25T16:20:00",
         "pending_issue_count": 3,
     }
+
+
+def test_project_result_summary_includes_completed_agent_run(tmp_path, monkeypatch) -> None:
+    """完成的 Agent 演示批次也应让项目列表显示结果。"""
+    monkeypatch.setattr(projects_router, "SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr(projects_router, "DATA_DIR", str(tmp_path))
+    project_id = "sample-one-created-project"
+    result_dir = tmp_path / "exports" / project_id
+    result_dir.mkdir(parents=True)
+    (result_dir / "演示结果.xlsx").write_bytes(b"demo-result")
+
+    run_dir = tmp_path / "agent-runs" / "tenant-hash"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "project_id": project_id,
+                "status": "completed",
+                "draft_filename": "演示结果.xlsx",
+                "updated_at": "2026-08-25T17:20:00+00:00",
+                "validation": {"status": "demo_reference_match"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert projects_router._project_result_summary(project_id) == {
+        "has_result": True,
+        "result_completed_at": "2026-08-25T17:20:00+00:00",
+        "pending_issue_count": 0,
+    }

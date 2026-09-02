@@ -485,6 +485,15 @@ def test_change_role_rejects_a_complete_master_workbook() -> None:
     assert "总表" in str(exc_info.value.detail)
 
 
+def test_financial_source_role_accepts_known_reference_template_filename() -> None:
+    """The next-month reference is an input for output layout, not the master."""
+    _validate_declared_workbook_role(
+        "financial_source",
+        ["工资核算", "工资汇总表", "工资条", "台账"],
+        filename="202608（所属月202607）-北京科园-鹤安-大药房工资核算总表-v2.xlsx",
+    )
+
+
 def test_ooxml_archive_rejects_excessive_uncompressed_content(monkeypatch) -> None:
     monkeypatch.setattr("backend.routers.projects._MAX_UNCOMPRESSED_WORKBOOK_BYTES", 4)
     content = BytesIO()

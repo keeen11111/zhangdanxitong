@@ -230,7 +230,7 @@ export function FinancialWorkbookIntegrationPage({ projectId }: { projectId: str
     </ol>
 
     {result ? <section className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-4 sm:p-5" aria-live="polite">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between"><div className="flex gap-3"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" /><div><h2 className="text-sm font-semibold text-emerald-950">整合完毕</h2><p className="mt-1 text-sm text-emerald-900">已自动更新 {result.auto_update_count} 个单元格，生成正式稿和修订稿{result.issues.length ? `；另有 ${result.issues.length} 项待人工处理。` : "，没有待人工处理事项。"}</p></div></div><Button asChild className="shrink-0 bg-teal-700 hover:bg-teal-800"><Link href={`/projects/${projectId}/result`}>查看结果</Link></Button></div>
+      <div className="flex gap-3"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" /><div><h2 className="text-sm font-semibold text-emerald-950">整合完毕</h2><p className="mt-1 text-sm text-emerald-900">已自动更新 {result.auto_update_count} 个单元格，生成正式稿和修订稿{result.issues.length ? `；另有 ${result.issues.length} 项待人工处理。` : "，没有待人工处理事项。"}</p></div></div>
     </section> : null}
 
     <div className="grid gap-5 lg:grid-cols-2">
@@ -244,6 +244,6 @@ export function FinancialWorkbookIntegrationPage({ projectId }: { projectId: str
 
     <section className="rounded-md border border-slate-200 bg-white p-4 sm:p-5"><div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h2 className="text-sm font-semibold text-slate-950">开始整合</h2><p className="mt-1 text-xs leading-5 text-slate-500">可安全确认的数据会写入总表，其他内容会在结果页直接列为待人工处理。</p></div><Button onClick={() => void integrate()} disabled={!ready || integrating || masterUploading || sourcesUploading} className="w-full bg-teal-700 hover:bg-teal-800 sm:w-auto">{integrating ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}{integrating ? "正在核对并更新…" : "开始核对并更新"}</Button></div>{integrating ? <FinancialIntegrationLoadingCard progress={integrationProgress} elapsedSeconds={integrationElapsedSeconds} fileCount={sources.length} /> : null}</section>
 
-    <Dialog open={completionOpen} onOpenChange={setCompletionOpen}><DialogContent><DialogHeader><DialogTitle>整合完毕</DialogTitle><DialogDescription>正式稿和修订稿已经生成{result?.issues.length ? `，另有 ${result.issues.length} 项待人工处理。` : "，没有待人工处理事项。"}</DialogDescription></DialogHeader><DialogFooter><Button type="button" variant="outline" onClick={() => setCompletionOpen(false)}>稍后查看</Button><Button asChild className="bg-teal-700 hover:bg-teal-800"><Link href={`/projects/${projectId}/result`}>查看结果</Link></Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={completionOpen} onOpenChange={setCompletionOpen}><DialogContent><DialogHeader><DialogTitle>整合完毕</DialogTitle><DialogDescription>正式稿和修订稿已经生成{result?.issues.length ? `，另有 ${result.issues.length} 项待人工处理。` : "，没有待人工处理事项。"}</DialogDescription></DialogHeader><DialogFooter><Button type="button" variant="outline" onClick={() => setCompletionOpen(false)}>关闭</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }

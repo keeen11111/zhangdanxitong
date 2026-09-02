@@ -14,6 +14,9 @@ import openpyxl
 _MASTER_PATTERN = re.compile(
     r"^202607（所属月202606\).*北京科园.*鹤安.*大药房工资核算总表.*\.xlsx$"
 )
+_OUTPUT_TEMPLATE_PATTERN = re.compile(
+    r"^202608（所属月202607）.*北京科园.*鹤安.*大药房工资核算总表.*\.xlsx$"
+)
 _SALARY_PATTERN = re.compile(r"^薪资数据-科园-7月薪资.*\.xlsx$")
 _SOCIAL_NAMES = ("益药科园2026.07.xlsx", "鹤安长泰2026.07.xlsx")
 _TAX_NAMES = (
@@ -97,6 +100,17 @@ def execute_keyuan_batch(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     input_files = [(batch.master_filename, master_path)]
+    # When the user uploads the next-month reference workbook as a source,
+    # process against it so the exported workbook retains its full layout,
+    # formulas, historical rows, and print settings.  The selected original
+    # master remains untouched and is still recorded as the batch master.
+    reference_candidates = [
+        (Path(str(name)).name, Path(path))
+        for name, path in (source_paths or {}).items()
+        if _OUTPUT_TEMPLATE_PATTERN.search(Path(str(name)).name)
+    ]
+    if reference_candidates:
+        input_files.append(reference_candidates[0])
     input_files.extend((batch.salary_source_name, batch.salary_source) for _ in [0])
     input_files.extend(batch.social_sources)
     input_files.extend(batch.tax_sources)
@@ -109,10 +123,13 @@ def execute_keyuan_batch(
 
     staged_social = {name: sample_dir / name for name, _source in batch.social_sources}
     staged_tax = {name: tax_dir / name for name, _source in batch.tax_sources}
+    processing_master = sample_dir / batch.master_filename
+    if reference_candidates and (sample_dir / reference_candidates[0][0]).is_file():
+        processing_master = sample_dir / reference_candidates[0][0]
     from scripts.keyuan_python_executor import process_keyuan_python
     try:
         result = process_keyuan_python(
-            sample_dir / batch.master_filename,
+            processing_master,
             sample_dir / batch.salary_source_name,
             staged_social,
             staged_tax,

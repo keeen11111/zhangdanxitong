@@ -749,6 +749,7 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   getProject: (id: string) => request<Project>(`/api/projects/${id}`),
+  completedDownloadUrl: (id: string) => `${API_BASE}/api/projects/${encodeURIComponent(id)}/completed-download`,
   deleteProject: (id: string) =>
     request<void>(`/api/projects/${id}`, { method: "DELETE" }),
   updateProjectStatus: (id: string, status: string) =>
@@ -790,7 +791,7 @@ export const api = {
   },
   listAgentRuns: (projectId: string) =>
     request<{ project_id: string; items: Record<string, unknown>[]; total: number }>(
-      `/api/agent/runs?project_id=${encodeURIComponent(projectId)}`,
+      `/api/agent/runs?project_id=${encodeURIComponent(projectId)}&_=${Date.now()}`,
     ).then((raw) => ({ ...raw, items: raw.items.map(mapAgentRun) })),
   listAgentEvents: (runId: string, afterRevision = 0) =>
     request<{ run_id: string; revision: number; events: AgentRunEvent[] }>(
@@ -845,9 +846,9 @@ export const api = {
       body: JSON.stringify(instruction ? { instruction } : {}),
     }).then(mapAgentRun),
   getAgentResult: (runId: string, page = 1, pageSize = 50) =>
-    request<AgentRunResult>(`/api/agent/runs/${encodeURIComponent(runId)}/output?page=${page}&page_size=${pageSize}`),
+    request<AgentRunResult>(`/api/agent/runs/${encodeURIComponent(runId)}/output?page=${page}&page_size=${pageSize}&_=${Date.now()}`),
   downloadAgentOutput: async (runId: string) => {
-    const response = await fetchWithTimeout(`${API_BASE}/api/agent/runs/${encodeURIComponent(runId)}/output/download`, {
+    const response = await fetchWithTimeout(`${API_BASE}/api/agent/runs/${encodeURIComponent(runId)}/output/download?_=${Date.now()}`, {
       headers: { Authorization: `Bearer ${getToken() || ""}` },
     }, 60_000, "下载超时，请重试");
     if (!response.ok) throw new Error("更新后表格下载失败，请确认校验状态");
@@ -870,6 +871,7 @@ export const api = {
     runId: string,
     message: string,
     onEvent: (event: AgentStreamEvent) => void,
+    signal?: AbortSignal,
   ) => {
     const token = getToken();
     const response = await fetchWithTimeout(
@@ -882,6 +884,7 @@ export const api = {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         body: JSON.stringify({ message }),
+        signal,
       },
       12_000,
       "未能连接到 Agent 服务，请检查服务状态后重试",
@@ -1192,7 +1195,7 @@ export const api = {
       { method: "POST" },
       {
         timeoutMs: FINANCIAL_INTEGRATION_TIMEOUT_MS,
-        timeoutMessage: "整合处理超过 15 分钟，已停止等待。请刷新页面后查看处理结果。",
+        timeoutMessage: "整合处理超过 15 分钟，已停止等待。请刷新页面查看当前状态。",
       },
     ),
   getIntegrationProgress: (projectId: string) =>

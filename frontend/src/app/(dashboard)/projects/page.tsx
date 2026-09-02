@@ -18,9 +18,9 @@ function dateLabel(value?: string | null) {
 }
 
 function statusFor(project: Project) {
-  if (!project.file_count) return { label: "等待文件", tone: "text-slate-500", dot: "bg-slate-300" };
   if (project.pending_issue_count > 0) return { label: `${project.pending_issue_count} 项待确认`, tone: "text-amber-700", dot: "bg-amber-500" };
   if (project.has_result) return { label: "已完成", tone: "text-emerald-700", dot: "bg-emerald-500" };
+  if (!project.file_count) return { label: "等待文件", tone: "text-slate-500", dot: "bg-slate-300" };
   return { label: "可以开始分析", tone: "text-blue-700", dot: "bg-blue-500" };
 }
 

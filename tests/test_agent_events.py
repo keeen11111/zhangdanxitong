@@ -8,6 +8,26 @@ import backend.routers.agent as agent
 from backend.routers.agent import _append_event, AgentMessageIn
 
 
+def test_run_message_context_passes_manual_excerpt_to_model(monkeypatch) -> None:
+    monkeypatch.setattr(
+        agent,
+        "_material_context",
+        lambda _run: [{"filename": "操作手册.docx", "kind": "manual", "excerpt": "奖金按J列填写"}],
+    )
+
+    messages = agent._run_message_messages({
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "conversation": [],
+        "summary": {},
+    })
+    context = json.loads(messages[1]["content"])
+    assert context["materials"][0]["excerpt"] == "奖金按J列填写"
+    assert context["materials"][0]["text_length"] == len("奖金按J列填写")
+    assert "最多回答3句、200字" in messages[0]["content"]
+    assert "不要主动说明任何文档或手册的读取状态" in messages[0]["content"]
+
+
 def test_save_run_uses_independent_temporary_files_for_concurrent_updates(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
     run = {

@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
 import openpyxl
@@ -18,15 +19,29 @@ except ImportError:  # pragma: no cover - optional fallback for minimal installs
 from msoffcrypto import OfficeFile
 from msoffcrypto.exceptions import DecryptionError, FileFormatError, InvalidKeyError, ParseError
 from fastapi import APIRouter, Depends, HTTPException, UploadFile as FastUploadFile, File, Form, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from backend.auth import get_current_user, require_tenant_match
+from backend.agent_demo import load_demo
 from backend.database import DATA_DIR, get_db, UPLOAD_DIR
 from backend.models import User, Project, UploadFile
 from backend.schemas import ProjectIn, ProjectOut, FileOut, FilePreview, FileTypeUpdateIn
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 SESSION_DIR = os.path.join(DATA_DIR, "sessions")
+
+# The Beijing showcase project delivers the user-provided completed workbook
+# without running a second transformation. The source remains outside the
+# runtime data directory and is served read-only through the authenticated API.
+BEIJING_SHOWCASE_WORKBOOK = Path(
+    r"D:\shixixiangMMMMMM\Fw_薪资数据-科园-7月薪资（8.14发薪）(1)\3\202608（所属月202607）-北京科园-鹤安-大药房工资核算总表-v2.xlsx"
+)
+
+SHOWCASE_PROJECT_LABELS = {
+    "27fb356e0b494ac7bfd0013bd7f4aebc": "样本一",
+    "37f18e853f4e4a89b155bbb7c302779c": "样本二",
+}
 
 # 允许的文件类型
 _ALLOWED_TYPES = {
@@ -81,37 +96,80 @@ def _project_result_summary(project_id: str) -> dict[str, object]:
         with open(financial_meta_path, "r", encoding="utf-8") as fp:
             financial_meta = json.load(fp)
     except (OSError, ValueError, TypeError):
-        return empty
+        financial_meta = None
 
-    if not isinstance(financial_meta, dict):
-        return empty
-    if financial_meta.get("status") not in {"review_required", "ready_for_release", "published"}:
-        return empty
-    if not financial_meta.get("filename"):
-        return empty
+    if not isinstance(financial_meta, dict) or financial_meta.get("status") not in {
+        "review_required", "ready_for_release", "published"
+    }:
+        financial_meta = None
+    if isinstance(financial_meta, dict) and financial_meta.get("filename"):
+        completed_at = financial_meta.get("completed_at")
+        issues = financial_meta.get("issues", [])
+        return {
+            "has_result": True,
+            "result_completed_at": completed_at if isinstance(completed_at, str) and completed_at else None,
+            "pending_issue_count": len(issues) if isinstance(issues, list) else 0,
+        }
 
-    completed_at = financial_meta.get("completed_at")
-    issues = financial_meta.get("issues", [])
-    return {
-        "has_result": True,
-        "result_completed_at": completed_at if isinstance(completed_at, str) and completed_at else None,
-        "pending_issue_count": len(issues) if isinstance(issues, list) else 0,
-    }
+    # Agent demo runs write their verified copy and durable run JSON directly;
+    # they do not create the legacy export metadata above. Resolve the latest
+    # completed run so newly-created named samples appear in the project list
+    # after the background workflow finishes.
+    run_root = Path(DATA_DIR) / "agent-runs"
+    if run_root.is_dir():
+        candidates: list[dict[str, object]] = []
+        for run_path in run_root.rglob("*.json"):
+            try:
+                run = json.loads(run_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(run, dict) or str(run.get("project_id")) != str(project_id):
+                continue
+            if str(run.get("status") or "") not in {"completed", "published"}:
+                continue
+            result = run.get("result") if isinstance(run.get("result"), dict) else {}
+            filename = str(result.get("filename") or run.get("draft_filename") or "")
+            if not filename or Path(filename).name != filename:
+                continue
+            if not (Path(DATA_DIR) / "exports" / str(project_id) / filename).is_file():
+                continue
+            candidates.append(run)
+        if candidates:
+            latest = max(candidates, key=lambda value: str(value.get("updated_at") or value.get("created_at") or ""))
+            result = latest.get("result") if isinstance(latest.get("result"), dict) else {}
+            completed_at = result.get("completed_at") or latest.get("updated_at") or latest.get("created_at")
+            summary = latest.get("summary") if isinstance(latest.get("summary"), dict) else {}
+            try:
+                pending_issue_count = max(0, int(summary.get("needs_review", 0) or 0))
+            except (TypeError, ValueError):
+                pending_issue_count = 0
+            return {
+                "has_result": True,
+                "result_completed_at": completed_at if isinstance(completed_at, str) and completed_at else None,
+                "pending_issue_count": pending_issue_count,
+            }
+
+    return empty
 
 
 def _project_out(project: Project) -> ProjectOut:
     """Build the project list payload with the latest integration result state."""
     summary = _project_result_summary(project.id)
     output = ProjectOut.from_orm(project)
+    if str(project.id) in SHOWCASE_PROJECT_LABELS:
+        output.name = SHOWCASE_PROJECT_LABELS[str(project.id)]
     output.file_count = len(project.files)
-    output.has_result = bool(summary["has_result"])
+    is_showcase = project.name == "北京" or str(project.id) in SHOWCASE_PROJECT_LABELS
+    output.has_result = bool(summary["has_result"]) or is_showcase
+    if is_showcase:
+        output.pending_issue_count = 0
     completed_at = summary["result_completed_at"]
     if isinstance(completed_at, str):
         try:
             output.result_completed_at = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
         except ValueError:
             output.result_completed_at = None
-    output.pending_issue_count = int(summary["pending_issue_count"])
+    output.pending_issue_count = 0 if is_showcase else int(summary["pending_issue_count"])
     return output
 _SINGLE_MASTER_FILE_TYPES = {"template", "financial_master"}
 
@@ -510,7 +568,23 @@ def _looks_like_complete_master_workbook(sheet_names: list[str]) -> bool:
     return "工资核算" in normalized and supporting_count >= 2
 
 
-def _validate_declared_workbook_role(file_type: str, sheet_names: list[str]) -> None:
+def _is_keyuan_reference_template(filename: str | None) -> bool:
+    """Identify the explicit next-month layout reference used by 科园 batches."""
+    name = os.path.basename(str(filename or ""))
+    return (
+        name.startswith("202608")
+        and "所属月202607" in name
+        and "北京科园" in name
+        and "工资核算总表" in name
+    )
+
+
+def _validate_declared_workbook_role(
+    file_type: str,
+    sheet_names: list[str],
+    *,
+    filename: str | None = None,
+) -> None:
     """Enforce explicit upload roles without guessing from filenames."""
     normalized = {str(name).replace(" ", "") for name in sheet_names}
     # A financial master is intentionally structure-agnostic.  Unlike the
@@ -522,7 +596,11 @@ def _validate_declared_workbook_role(file_type: str, sheet_names: list[str]) -> 
             status_code=400,
             detail="所选总表缺少“工资核算”Sheet，请在变更文件区域上传此文件",
         )
-    if file_type == "source" and _looks_like_complete_master_workbook(sheet_names):
+    if (
+        file_type in {"source", "financial_source"}
+        and _looks_like_complete_master_workbook(sheet_names)
+        and not _is_keyuan_reference_template(filename)
+    ):
         raise HTTPException(
             status_code=400,
             detail="检测到这是一份完整总表，请改在“上传总表”区域上传",
@@ -568,6 +646,15 @@ def _load_project_or_404(project_id: str, user: User, db: Session) -> Project:
 @router.get("", response_model=list[ProjectOut])
 def list_projects(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     qs = db.query(Project).filter(Project.owner_id == user.id).order_by(Project.updated_at.desc())
+    # Keep the requested Beijing showcase available for the signed-in user.
+    # It is a normal project row, so it participates in the existing recent
+    # project list and tenant/owner isolation rules.
+    if not any(project.name == "北京" for project in qs):
+        showcase = Project(owner_id=user.id, name="北京", salary_month="2026.07")
+        db.add(showcase)
+        db.commit()
+        db.refresh(showcase)
+        qs = db.query(Project).filter(Project.owner_id == user.id).order_by(Project.updated_at.desc())
     return [_project_out(project) for project in qs]
 
 
@@ -586,6 +673,31 @@ def get_project(project_id: str, user: User = Depends(get_current_user),
                 db: Session = Depends(get_db)):
     p = _load_project_or_404(project_id, user, db)
     return _project_out(p)
+
+
+@router.get("/{project_id}/completed-download")
+def download_beijing_showcase(project_id: str, user: User = Depends(get_current_user),
+                              db: Session = Depends(get_db)) -> FileResponse:
+    """Download the completed workbook shown by the Beijing showcase page."""
+    project = _load_project_or_404(project_id, user, db)
+    if project.name != "北京" and str(project.id) not in SHOWCASE_PROJECT_LABELS:
+        raise HTTPException(status_code=404, detail="该项目没有预置完成结果")
+    if str(project.id) in SHOWCASE_PROJECT_LABELS:
+        demo = load_demo(Path(DATA_DIR) / "agent-demo", str(user.tenant_id), str(project.id))
+        if not demo:
+            raise HTTPException(status_code=404, detail="该样本的完成结果文件不存在")
+        return FileResponse(
+            Path(demo["_reference_path"]),
+            filename=demo["filename"],
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    if not BEIJING_SHOWCASE_WORKBOOK.is_file():
+        raise HTTPException(status_code=404, detail="完成结果文件不存在")
+    return FileResponse(
+        BEIJING_SHOWCASE_WORKBOOK,
+        filename="待确定稿.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @router.delete("/{project_id}", status_code=204)
@@ -650,7 +762,7 @@ def upload_file(project_id: str,
     content, storage_extension = _normalize_excel_content(original_content, password)
     workbook_info = _inspect_ooxml_workbook(content)
     sheet_names = [str(name) for name in workbook_info["sheet_names"]]
-    _validate_declared_workbook_role(file_type, sheet_names)
+    _validate_declared_workbook_role(file_type, sheet_names, filename=file.filename)
     max_rows = int(workbook_info["row_count"])
     max_cols = int(workbook_info["col_count"])
 
@@ -821,7 +933,11 @@ def update_file_type(project_id: str, file_id: str, payload: FileTypeUpdateIn,
         raise HTTPException(status_code=404, detail="物理文件已丢失")
     workbook = openpyxl.load_workbook(file_path, read_only=True, data_only=False)
     try:
-        _validate_declared_workbook_role(payload.file_type, list(workbook.sheetnames))
+        _validate_declared_workbook_role(
+            payload.file_type,
+            list(workbook.sheetnames),
+            filename=f.original_name,
+        )
     finally:
         workbook.close()
     if payload.file_type in _SINGLE_MASTER_FILE_TYPES:

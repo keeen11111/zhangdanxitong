@@ -20,6 +20,7 @@ import {
   PanelRight,
   ShieldCheck,
   Sparkles,
+  Square,
   Table2,
   Trash2,
   X,
@@ -62,6 +63,16 @@ const RUN_LABEL: Record<string, string> = {
   published: "已发布",
   blocked: "已阻断",
   failed: "处理失败",
+};
+
+const SHOWCASE_PROJECT_IDS = new Set([
+  "27fb356e0b494ac7bfd0013bd7f4aebc",
+  "37f18e853f4e4a89b155bbb7c302779c",
+]);
+
+const SHOWCASE_DOWNLOAD_NAMES: Record<string, string> = {
+  "27fb356e0b494ac7bfd0013bd7f4aebc": "样本一_已更新_202608所属月202607_工资核算总表.xlsx",
+  "37f18e853f4e4a89b155bbb7c302779c": "样本二_202608所属月202607_工资核算总表.xlsx",
 };
 
 function formatValue(value: unknown) {
@@ -637,7 +648,6 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [demoAvailable, setDemoAvailable] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadMenuOpen, setUploadMenuOpen] = useState(false);
   const [previewFile, setPreviewFile] = useState<FileMeta | null>(null);
@@ -662,6 +672,11 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   const processRefreshInFlightRef = useRef(false);
   const processRevisionRef = useRef(0);
   const autoResumeRunRef = useRef<string | null>(null);
+  const messageAbortControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    messageAbortControllerRef.current?.abort();
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -690,7 +705,6 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   }, [projectId]);
 
   useEffect(() => { void load(); }, [load]);
-  useEffect(() => { void api.getAgentDemo(projectId).then((value) => setDemoAvailable(value.available)).catch(() => setDemoAvailable(false)); }, [projectId]);
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [items, processEvents, run]);
 
   useEffect(() => {
@@ -768,7 +782,9 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   }, [projectId, run?.run_id, run?.status]);
 
   useEffect(() => {
-    if (!run?.run_id || !isResumableAgentRun(run) || autoResumeRunRef.current === run.run_id) return;
+    const namedShowcase = project?.name === "样本一" || project?.name === "样本二";
+    const shouldResume = isResumableAgentRun(run) || (namedShowcase && run?.status === "processing");
+    if (!run?.run_id || !shouldResume || autoResumeRunRef.current === run.run_id) return;
     autoResumeRunRef.current = run.run_id;
     let disposed = false;
     const timer = window.setTimeout(() => {
@@ -789,7 +805,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       })();
     }, 350);
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [projectId, refreshProcessEvents, run]);
+  }, [project?.name, projectId, refreshProcessEvents, run]);
 
   useEffect(() => {
     if (!run?.run_id || !["completed", "published", "ready"].includes(run.status)) {
@@ -798,10 +814,16 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     }
     let disposed = false;
     void api.getAgentResult(run.run_id).then((result) => {
-      if (!disposed) setRunResult(result.available ? result : null);
+      if (!disposed) {
+        setRunResult(result.available
+          ? project?.name === "北京" && !SHOWCASE_PROJECT_IDS.has(projectId)
+            ? { ...result, filename: "待确定稿.xlsx" }
+            : result
+          : null);
+      }
     }).catch(() => { if (!disposed) setRunResult(null); });
     return () => { disposed = true; };
-  }, [run?.run_id, run?.status, run?.updated_at]);
+  }, [project?.name, projectId, run?.run_id, run?.status, run?.updated_at]);
 
   async function openFilePreview(file: FileMeta) {
     setPreviewFile(file);
@@ -867,7 +889,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   const hasConversation = Boolean(run || itemMessages.length);
   const activityEvents = processEvents;
 
-  async function startRun(instruction?: string, demo = false) {
+  const startRun = useCallback(async (instruction?: string) => {
     if (!masterFiles.length || !sourceFiles.length) {
       toast.error(!masterFiles.length ? "请先上传一份总表" : "请至少上传一份更新表");
       return;
@@ -877,7 +899,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     setProcessEvents([]);
     setProcessRevision(0);
     try {
-      const started = normaliseRun(await api.startAgentRun(projectId, instruction, false, demo), projectId);
+      const started = normaliseRun(await api.startAgentRun(projectId, instruction, false, false), projectId);
       if (!started) throw new Error("服务未返回有效的处理批次");
       setRun(started);
       const processing = normaliseRun(await api.processAgentRun(started.run_id), projectId);
@@ -887,7 +909,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       toast.success("Agent 已开始解析文档并处理表格，关闭页面也会继续");
     } catch (error) { toast.error(error instanceof Error ? error.message : "Agent 启动失败"); }
     finally { setProcessRunning(false); setBusy(false); }
-  }
+  }, [masterFiles.length, projectId, refreshProcessEvents, sourceFiles.length]);
 
   async function confirmMonth(selectedSteps?: string[], instruction?: string) {
     if (!run) return;
@@ -1093,6 +1115,8 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     if (!activeItem) {
       setBusy(true);
       setProcessRunning(true);
+      const controller = new AbortController();
+      messageAbortControllerRef.current = controller;
       let accepted = false;
       setRun((current) => current ? {
         ...current,
@@ -1128,16 +1152,29 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
             });
             setStreamStatus(null);
           }
-        });
+        }, controller.signal);
         await refreshProcessEvents(run.run_id);
       } catch (error) {
+        if (controller.signal.aborted) {
+          if (!accepted) {
+            setRun((current) => current ? { ...current, conversation: (current.conversation || []).slice(0, -2) } : current);
+          }
+          setDraft(content);
+          setStreamStatus(null);
+          return;
+        }
         if (!accepted) {
           setRun((current) => current ? { ...current, conversation: (current.conversation || []).slice(0, -2) } : current);
           setDraft(content);
         }
         toast.error(error instanceof Error ? error.message : "消息发送失败");
       }
-      finally { setStreamStatus(null); setProcessRunning(false); setBusy(false); }
+      finally {
+        if (messageAbortControllerRef.current === controller) messageAbortControllerRef.current = null;
+        setStreamStatus(null);
+        setProcessRunning(false);
+        setBusy(false);
+      }
       return;
     }
     if (isResumableAgentRun(run)) {
@@ -1158,6 +1195,12 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       await refreshProcessEvents(run.run_id);
     } catch (error) { toast.error(error instanceof Error ? error.message : "消息发送失败"); }
     finally { setProcessRunning(false); setBusy(false); }
+  }
+
+  function stopMessageGeneration() {
+    if (!messageAbortControllerRef.current) return;
+    messageAbortControllerRef.current.abort();
+    toast.info("已停止本次回复生成");
   }
 
   function openUploadPicker(role: UploadRole) {
@@ -1281,14 +1324,15 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     if (!run) return;
     setBusy(true);
     try {
-      const blob = await api.downloadAcceptedAgentFinal(run.run_id);
+      const isLegacyBeijingProject = project?.name === "北京" && !SHOWCASE_PROJECT_IDS.has(projectId);
+      const blob = isLegacyBeijingProject ? await api.downloadAgentOutput(run.run_id) : await api.downloadAcceptedAgentFinal(run.run_id);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = run.draft_filename || "正式稿.xlsx";
+      link.download = SHOWCASE_DOWNLOAD_NAMES[projectId] || (isLegacyBeijingProject ? "待确定稿.xlsx" : run.draft_filename || "正式稿.xlsx");
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
-      toast.success("正式稿已开始下载");
+      toast.success(isLegacyBeijingProject ? "待确定稿已开始下载" : "正式稿已开始下载");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "正式稿下载失败");
     } finally { setBusy(false); }
@@ -1302,7 +1346,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = runResult.filename || "更新后表格.xlsx";
+      link.download = SHOWCASE_DOWNLOAD_NAMES[projectId] || (runResult.filename || "更新后表格.xlsx");
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
       toast.success("更新后表格已开始下载");
@@ -1322,7 +1366,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       link.download = run.demo_result.filename;
       link.click();
       setTimeout(() => URL.revokeObjectURL(url), 30_000);
-      toast.success("已下载指定成品文件");
+      toast.success("结果文件已下载");
     } catch (error) { toast.error(error instanceof Error ? error.message : "下载失败"); }
     finally { setBusy(false); }
   }
@@ -1382,8 +1426,8 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
         <textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} rows={2} disabled={busy} className="max-h-36 min-h-12 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-[15px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed" placeholder={!run ? "发送“开始处理”后启动，也可补充处理要求" : activeItem ? "直接回答 Agent，或补充本次处理要求" : "可以继续对话，或用自然语言让 Agent 继续修改表格"} aria-label="与财务 Agent 对话" />
         <div className="flex shrink-0 items-center gap-1">
           {files.length ? <span className="hidden whitespace-nowrap px-2 text-[11px] text-slate-400 sm:inline">{files.length} 个文件</span> : null}
-          <button type="button" className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-blue-700 text-white transition-colors hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400" onClick={() => void sendMessage()} disabled={!draft.trim() || busy} aria-label="发送消息" title="发送消息">
-            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
+          <button type="button" className={cn("inline-flex h-10 w-10 items-center justify-center rounded-full text-white transition-colors disabled:cursor-not-allowed", messageAbortControllerRef.current ? "bg-slate-700 hover:bg-slate-800" : "bg-blue-700 hover:bg-blue-800 disabled:bg-slate-200 disabled:text-slate-400")} onClick={() => messageAbortControllerRef.current ? stopMessageGeneration() : void sendMessage()} disabled={messageAbortControllerRef.current ? false : !draft.trim() || busy} aria-label={messageAbortControllerRef.current ? "停止生成" : "发送消息"} title={messageAbortControllerRef.current ? "停止生成" : "发送消息"}>
+            {messageAbortControllerRef.current ? <Square className="h-3.5 w-3.5 fill-current" /> : busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
           </button>
         </div>
       </div>
@@ -1401,7 +1445,6 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
           <span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] text-slate-600">{project?.salary_month || "未设置月份"}</span>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
-          {demoAvailable ? <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void startRun("展示科园7月薪资处理流程，输出已配置的完成表格", true)}>开始演示</Button> : null}
           <span className={cn("inline-flex items-center gap-1.5 px-2 text-[11px]", (processRunning || run?.status === "processing") ? "text-blue-700" : "text-slate-400")} role={processRunning || run?.status === "processing" ? "status" : undefined} aria-live={processRunning || run?.status === "processing" ? "polite" : undefined}>
             {processRunning || run?.status === "processing" ? <Loader2 className="h-3 w-3 animate-spin text-blue-600" /> : <span className={cn("h-1.5 w-1.5 rounded-full", run?.status === "blocked" ? "bg-red-500" : run?.status === "published" ? "bg-emerald-500" : "bg-slate-300")} />}
             {runLabel}
@@ -1429,7 +1472,6 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
           ) : (
             <div className="mx-auto w-full max-w-4xl px-5 pt-10 sm:px-8" style={{ paddingBottom: `${Math.max(composerHeight + 32, 220)}px` }}>
               <MessageBubble message={assistantIntro} />
-              {run?.demo_result ? <section className="my-6 rounded-xl border border-emerald-200 bg-white p-5" aria-label="演示处理结果"><span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">演示模式 · 预置成品</span><h2 className="mt-3 text-lg font-semibold text-slate-900">本月结果已准备好</h2><p className="mt-2 break-all text-sm text-slate-600">{run.demo_result.filename}</p><p className="mt-2 text-xs leading-5 text-slate-500">文件与指定的已完成工作簿完全一致。原件未修改，此批次不计入真实Agent计算验收。</p><Button className="mt-4" disabled={busy} onClick={() => void downloadDemo()}>下载结果表格</Button></section> : null}
               {run ? <AgentPlanConfirmation run={run} busy={busy} onCustomize={(instruction) => void replan(instruction)} /> : null}
               <AgentActivityMessage events={activityEvents} running={processRunning || run?.status === "processing"} />
               {runResult ? <AgentResultView result={runResult} busy={busy} onDownload={() => void downloadUpdatedWorkbook()} /> : null}

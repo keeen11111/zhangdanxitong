@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import ast
+import http.client
 import time
 import urllib.error
 import urllib.request
@@ -235,7 +236,7 @@ class OpenAICompatibleProvider:
             decoded = json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raise ModelProviderError(_http_error_message(exc.code)) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             raise ModelProviderError("模型服务暂时不可用") from exc
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ModelProviderError("模型响应不是有效 JSON") from exc
@@ -334,7 +335,7 @@ class OpenAICompatibleProvider:
             raise
         except urllib.error.HTTPError as exc:
             raise ModelProviderError(_http_error_message(exc.code)) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             raise ModelProviderError("模型服务暂时不可用") from exc
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ModelProviderError("模型流式响应无效") from exc
@@ -361,7 +362,7 @@ class OpenAICompatibleProvider:
             return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raise ModelProviderError(_http_error_message(exc.code)) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             raise ModelProviderError("模型服务暂时不可用") from exc
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ModelProviderError("模型响应不是有效 JSON") from exc

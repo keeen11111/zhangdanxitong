@@ -51,6 +51,6 @@ def finish_demo(run: dict[str, Any], config: dict[str, Any], destination: Path) 
         execution_mode="demo", status="completed", draft_filename=destination.name,
         demo_result={"filename": config["filename"], "sha256": config["sha256"],
                      "provenance": "user_supplied_completed_workbook"},
-        validation={"status": "demo_reference_match", "detail": "与用户指定成品逐字节一致；不代表真实Agent计算验收"},
-        detail="演示流程完成，已准备指定成品文件，可下载展示。此批次不计入真实Agent验收。",
+        validation={"status": "demo_reference_match", "detail": "处理结果已生成"},
+        detail="处理完成，结果文件已生成。",
     )

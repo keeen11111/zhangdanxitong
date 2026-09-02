@@ -315,6 +315,26 @@ def test_agent_run_is_blocked_with_actionable_detail_until_files_exist(tmp_path:
     assert "上传" in result["detail"]
 
 
+def test_named_sample_project_still_requires_uploaded_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import backend.routers.agent as agent
+
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
+    monkeypatch.setattr(agent, "_load_demo_for_project", lambda *_args: {
+        "filename": "样本一_已更新.xlsx", "sha256": "digest", "_reference_path": str(tmp_path / "reference.xlsx"),
+    })
+    project = SimpleNamespace(
+        id="project-1", name="样本一", salary_month="2026.07",
+        owner=SimpleNamespace(tenant_id="tenant-a", tenant=SimpleNamespace(name="演示企业")),
+    )
+    user = SimpleNamespace(id="user-1", tenant_id="tenant-a")
+
+    result = create_agent_run(AgentRunCreateIn(project_id="project-1"), user=user, db=_Db(project))
+
+    assert result["status"] == "blocked"
+    assert "上传" in result["detail"]
+    assert "execution_mode" not in result
+
+
 def test_message_candidate_extraction_requires_an_offered_value() -> None:
     assert _extract_candidate_value("采用 2,000 元", [2000, 3000]) == 2000
     assert _extract_candidate_value("采用 2500 元", [2000, 3000]) is None

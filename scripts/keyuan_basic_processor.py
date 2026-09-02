@@ -60,6 +60,31 @@ def _write(
     })
 
 
+def _set(
+    changes: list[dict[str, Any]],
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    row: int,
+    col: int,
+    value: Any,
+    source: str,
+    rule: str,
+) -> None:
+    """Write an explicitly sourced value, including replacing stale links."""
+    cell = sheet.cell(row, col)
+    before = cell.value
+    if before == value:
+        return
+    cell.value = value
+    changes.append({
+        "sheet": sheet.title,
+        "cell": cell.coordinate,
+        "before": before,
+        "after": value,
+        "source": source,
+        "rule": rule,
+    })
+
+
 def _rows_by_name(sheet: openpyxl.worksheet.worksheet.Worksheet, column: int, start_row: int) -> dict[str, int]:
     return {
         name: row
@@ -74,6 +99,141 @@ def _sheet_with_prefix(workbook: openpyxl.Workbook, prefixes: tuple[str, ...]) -
         if any(sheet_name == prefix or sheet_name.startswith(prefix) for prefix in prefixes):
             return workbook[sheet_name]
     return None
+
+
+def _salary_sheet(workbook: openpyxl.Workbook, label: str) -> openpyxl.worksheet.worksheet.Worksheet | None:
+    """Find a source sheet by its stable business label."""
+    for name in workbook.sheetnames:
+        if _text(name) == label or _text(name).startswith(label):
+            return workbook[name]
+    return None
+
+
+def _apply_salary_reference_sheets(
+    master: openpyxl.Workbook,
+    source: openpyxl.Workbook,
+    changes: list[dict[str, Any]],
+    issues: list[dict[str, str]],
+    source_name: str,
+) -> None:
+    """Apply the non-transactional tabs that have an explicit master mapping."""
+    payroll = master["工资核算"]
+    payroll_rows = {
+        _text(payroll.cell(row, 2).value): row
+        for row in range(4, min(43, payroll.max_row) + 1)
+        if _text(payroll.cell(row, 2).value)
+    }
+
+    transfer = _salary_sheet(source, "入离职、转岗、转正、其他")
+    if transfer is not None:
+        for row in range(1, transfer.max_row + 1):
+            name = _text(transfer.cell(row, 2).value)
+            effective = transfer.cell(row, 10).value
+            monthly_salary = transfer.cell(row, 11).value
+            if (
+                name in payroll_rows
+                and hasattr(effective, "year")
+                and effective.year == 2026
+                and effective.month == 7
+                and isinstance(monthly_salary, (int, float))
+            ):
+                target_row = payroll_rows[name]
+                _set(changes, payroll, target_row, 25, monthly_salary, source_name, "当月内部调动月薪")
+                _set(changes, payroll, target_row, 27, monthly_salary, source_name, "同步调整工资基数")
+
+    benefits = _salary_sheet(source, "年节福利")
+    if benefits is not None:
+        for row in range(2, benefits.max_row + 1):
+            name = _text(benefits.cell(row, 1).value)
+            annual = benefits.cell(row, 2).value
+            if name not in payroll_rows or not isinstance(annual, (int, float)):
+                continue
+            value = f"{annual:g}/年"
+            _set(changes, payroll, payroll_rows[name], 17, value, source_name, "按年节福利更新过节费")
+
+    heat_source = _salary_sheet(source, "高温费")
+    heat = master["防暑降温费"] if "防暑降温费" in master.sheetnames else None
+    if heat_source is not None and heat is not None:
+        heat_rows = {
+            _text(heat.cell(row, 2).value): row
+            for row in range(2, heat.max_row + 1)
+            if _text(heat.cell(row, 2).value)
+        }
+        for row in range(2, heat_source.max_row + 1):
+            name = _text(heat_source.cell(row, 1).value)
+            annual = heat_source.cell(row, 2).value
+            if name in heat_rows and isinstance(annual, (int, float)):
+                # The template may contain an external-link formula here;
+                # replacing it with the monthly source value removes the link
+                # and makes the result portable.
+                _set(changes, heat, heat_rows[name], 10, annual, source_name, "按姓名写入年度高温费标准")
+
+    cycle_source = _salary_sheet(source, "科园做一休一人员")
+    if cycle_source is not None:
+        cycle_names = {
+            _text(cycle_source.cell(row, 1).value)
+            for row in range(1, cycle_source.max_row + 1)
+            if _text(cycle_source.cell(row, 1).value)
+        }
+        for name, row in {
+            _text(master["考勤"].cell(row, 2).value): row
+            for row in range(2, master["考勤"].max_row + 1)
+            if _text(master["考勤"].cell(row, 2).value)
+        }.items():
+            if name in cycle_names:
+                _set(changes, master["考勤"], row, 17, "上一休一", source_name, "按做一休一名单更新班制")
+
+    # Late/early records marked as 豁免 are deliberately left untouched.  The
+    # source also contains explanatory historical notes rather than a complete
+    # current-month target mapping, so no other cells are guessed here.
+    if _salary_sheet(source, "迟到早退旷工") is not None:
+        issues.append({"item": "迟到早退旷工", "detail": "豁免记录按要求保持原样，未覆盖总表数据"})
+
+    for label in ("奖金-6月", "考勤-6月"):
+        if _salary_sheet(source, label) is not None:
+            issues.append({"item": label, "detail": "历史来源仅用于比对；总表没有对应历史明细承载区，未覆盖7月数据"})
+
+
+def _roll_oa_month(
+    sheet: openpyxl.worksheet.worksheet.Worksheet,
+    changes: list[dict[str, Any]],
+    source_name: str,
+    value_sheet: openpyxl.worksheet.worksheet.Worksheet | None = None,
+) -> None:
+    """Add the current month at row 8 while preserving the prior month history."""
+    if _text(sheet.cell(8, 1).value) == "7月":
+        return
+    max_col = min(11, sheet.max_column)
+    for row in range(min(13, sheet.max_row), 7, -1):
+        for col in range(1, max_col + 1):
+            source = sheet.cell(row, col)
+            target = sheet.cell(row + 1, col)
+            before = target.value
+            # Historical rows must remain snapshots.  Copying a formula such
+            # as ``=C8`` into the June row makes June follow the new July
+            # total, which is exactly the month-only update bug.  Use the
+            # original workbook's cached result for formula cells while
+            # retaining literal historical values as-is.
+            source_value = source.value
+            if (
+                value_sheet is not None
+                and (source.data_type == "f" or (isinstance(source_value, str) and source_value.startswith("=")))
+            ):
+                source_value = value_sheet.cell(row, col).value
+            target.value = source_value
+            if source.has_style:
+                target._style = source._style
+            target.number_format = source.number_format
+            if before != target.value:
+                changes.append({
+                    "sheet": sheet.title,
+                    "cell": target.coordinate,
+                    "before": before,
+                    "after": target.value,
+                    "source": source_name,
+                    "rule": "OA月份顺延保留历史",
+                })
+    _write(changes, sheet.title, sheet.cell(8, 1), "7月", source=source_name, rule="OA新增7月", issues=[])
 
 
 def process_keyuan_basics(master_path: Path, salary_source_path: Path, output_path: Path) -> dict[str, Any]:
@@ -95,19 +255,33 @@ def process_keyuan_basics(master_path: Path, salary_source_path: Path, output_pa
     if not output_path.exists():
         shutil.copy2(master_path, output_path)
     master = openpyxl.load_workbook(output_path, data_only=False)
+    cached_master = openpyxl.load_workbook(master_path, data_only=True, read_only=True)
     source = openpyxl.load_workbook(salary_source_path, data_only=True, read_only=True)
     changes: list[dict[str, Any]] = []
     issues: list[dict[str, str]] = []
     source_name = salary_source_path.name
     try:
+        from scripts.keyuan_python_executor import _apply_personnel_changes
+
         payroll = master["工资核算"]
         attendance = master["考勤"]
         duty = master["配送员值班费"]
         adjustment = master["其他调差累计"]
+        if "OA请款及审批" in master.sheetnames:
+            _roll_oa_month(
+                master["OA请款及审批"],
+                changes,
+                source_name,
+                cached_master["OA请款及审批"] if "OA请款及审批" in cached_master.sheetnames else None,
+            )
         bonus = _sheet_with_prefix(source, ("奖金-", "奖金"))
         source_attendance = _sheet_with_prefix(source, ("考勤-", "考勤"))
         source_duty = _sheet_with_prefix(source, ("值班",))
         source_adjustment = _sheet_with_prefix(source, ("补发补扣", "调差"))
+        _apply_salary_reference_sheets(master, source, changes, issues, source_name)
+        personnel_source = _salary_sheet(source, "入离职、转岗、转正、其他")
+        if personnel_source is not None and "人员异动" in master.sheetnames:
+            _apply_personnel_changes(master["人员异动"], personnel_source, changes, issues, source_name)
         for label, sheet in (("奖金", bonus), ("考勤", source_attendance), ("值班", source_duty), ("补发补扣", source_adjustment)):
             if sheet is None:
                 issues.append({"item": label, "detail": f"来源文件未找到{label} Sheet，本项交由 Agent 继续核对"})
@@ -179,6 +353,7 @@ def process_keyuan_basics(master_path: Path, salary_source_path: Path, output_pa
         master.save(output_path)
     finally:
         source.close()
+        cached_master.close()
         master.close()
 
     return {

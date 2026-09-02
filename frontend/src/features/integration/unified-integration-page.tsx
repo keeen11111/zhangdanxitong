@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
 import { CheckCircle2, FileSpreadsheet, Loader2, Search, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 
@@ -23,7 +22,6 @@ function fileSummary(file: FileMeta) {
 
 export function UnifiedIntegrationPage({ projectId }: { projectId: string }) {
   const inputRef = useRef<HTMLInputElement>(null);
-  const router = useRouter();
   const [project, setProject] = useState<Project | null>(null);
   const [files, setFiles] = useState<FileMeta[]>([]);
   const [result, setResult] = useState<Result | null>(null);
@@ -123,8 +121,6 @@ export function UnifiedIntegrationPage({ projectId }: { projectId: string }) {
     }
   }
 
-  const openResult = () => router.push(`/projects/${projectId}/result`);
-
   return (
     <div className="payroll-page max-w-6xl pb-8">
       <header className="border-b border-slate-200/90 pb-7">
@@ -139,7 +135,6 @@ export function UnifiedIntegrationPage({ projectId }: { projectId: string }) {
             <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" />
             <div><p className="text-sm font-semibold text-emerald-950">已有制作结果</p><p className="mt-1 text-xs text-emerald-800">{result.filename} · {result.issue_count} 项待人工处理</p></div>
           </div>
-          <Button onClick={openResult} className="bg-emerald-700 shadow-sm hover:bg-emerald-800">查看制作结果</Button>
         </section>
       ) : null}
 
@@ -166,7 +161,7 @@ export function UnifiedIntegrationPage({ projectId }: { projectId: string }) {
       <Dialog open={completionOpen} onOpenChange={setCompletionOpen}>
         <DialogContent>
           <DialogHeader><DialogTitle>制作完成</DialogTitle><DialogDescription>总表和{result?.issue_count || 0}项人工处理记录已准备好，可在成果页预览、改名、直接下载或选择保存位置。</DialogDescription></DialogHeader>
-          <DialogFooter><Button variant="outline" onClick={() => setCompletionOpen(false)}>稍后查看</Button><Button onClick={openResult} className="bg-sky-700 hover:bg-sky-800">查看制作结果</Button></DialogFooter>
+          <DialogFooter><Button variant="outline" onClick={() => setCompletionOpen(false)}>关闭</Button></DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

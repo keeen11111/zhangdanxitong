@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
 import { AlertTriangle, CheckCircle2, Clock3, Download, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -98,7 +97,6 @@ function IntegrationLoadingCard({
 }
 
 export function MasterUpdatePage({ projectId }: { projectId: string }) {
-  const router = useRouter();
   const [project, setProject] = useState<Project | null>(null);
   const [files, setFiles] = useState<FileMeta[]>([]);
   const [result, setResult] = useState<Result | null>(null);
@@ -250,11 +248,6 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
     }
   }
 
-  function openResult() {
-    closeCompletionNotice();
-    router.push(`/projects/${projectId}/result`);
-  }
-
   function closeCompletionNotice() {
     setCompletionOpen(false);
     if (result?.filename) {
@@ -286,7 +279,7 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
 
       <ol className="flex flex-col gap-2 border-y border-slate-200 py-3 text-sm sm:flex-row sm:items-center sm:gap-6" aria-label="更新步骤"><StepLabel current={step} step={1}>上传总表</StepLabel><StepLabel current={step} step={2}>上传变更文件</StepLabel><StepLabel current={step} step={3}>更新总表</StepLabel></ol>
 
-      {result?.filename ? <section className="rounded-md border border-emerald-200 bg-emerald-50 p-4"><div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-start gap-3"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" /><div><h2 className="text-sm font-semibold text-emerald-950">最终总表已更新</h2><p className="mt-1 text-xs text-emerald-800">{result.issue_count ? `还有 ${result.issue_count} 项需要人工填写。` : "没有需要人工填写的事项。"}</p></div></div><Button onClick={openResult} className="bg-teal-700 hover:bg-teal-800">查看处理结果</Button></div><div className="mt-3 flex flex-col gap-2 border-t border-emerald-200 pt-3 sm:flex-row"><Button type="button" size="sm" variant="outline" className="border-teal-300 bg-white text-teal-900 hover:bg-teal-50" disabled={downloading !== null} onClick={() => void downloadWorkbook("formal")}>{downloading === "formal" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载正式稿</Button>{result.review_filename ? <Button type="button" size="sm" variant="outline" className="border-amber-300 bg-white text-amber-950 hover:bg-amber-50" disabled={downloading !== null} onClick={() => void downloadWorkbook("review")}>{downloading === "review" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载修改稿（含变更批注）</Button> : null}</div></section> : null}
+      {result?.filename ? <section className="rounded-md border border-emerald-200 bg-emerald-50 p-4"><div className="flex items-start gap-3"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" /><div><h2 className="text-sm font-semibold text-emerald-950">最终总表已更新</h2><p className="mt-1 text-xs text-emerald-800">{result.issue_count ? `还有 ${result.issue_count} 项需要人工填写。` : "没有需要人工填写的事项。"}</p></div></div><div className="mt-3 flex flex-col gap-2 border-t border-emerald-200 pt-3 sm:flex-row"><Button type="button" size="sm" variant="outline" className="border-teal-300 bg-white text-teal-900 hover:bg-teal-50" disabled={downloading !== null} onClick={() => void downloadWorkbook("formal")}>{downloading === "formal" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载正式稿</Button>{result.review_filename ? <Button type="button" size="sm" variant="outline" className="border-amber-300 bg-white text-amber-950 hover:bg-amber-50" disabled={downloading !== null} onClick={() => void downloadWorkbook("review")}>{downloading === "review" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载修改稿（含变更批注）</Button> : null}</div></section> : null}
 
       {step === 1 ? <WorkbookUploadPanel title="第 1 步：上传总表" description="选择这次需要更新的总表。" helper="选择总表" files={masters} uploading={masterUploading} tone="master" onSelect={(selected) => void uploadMaster(selected)} onRemove={(file) => void removeFile(file)} /> : null}
 
@@ -296,7 +289,7 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
 
       {failures.length ? <section className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3" role="alert"><div className="flex items-center gap-2"><AlertTriangle className="h-4 w-4 text-amber-700" /><h2 className="text-sm font-semibold text-amber-950">有文件未上传</h2></div><ul className="mt-2 space-y-1 text-xs text-amber-900">{failures.map((failure) => <li key={`${failure.filename}-${failure.message}`}>{failure.filename}：{failure.message}</li>)}</ul></section> : null}
 
-      <Dialog open={completionOpen} onOpenChange={(open) => { if (open) setCompletionOpen(true); else closeCompletionNotice(); }}><DialogContent><DialogHeader><DialogTitle>总表已更新</DialogTitle><DialogDescription>{result?.issue_count ? `还有 ${result.issue_count} 项需要人工填写。` : "全部内容已更新完成。"} 修改稿会保留与正式稿相同的数据，并标注本次更新的原值和新值。</DialogDescription></DialogHeader><DialogFooter><Button type="button" variant="outline" onClick={closeCompletionNotice}>稍后查看</Button><Button onClick={openResult} className="bg-teal-700 hover:bg-teal-800">立即查看结果</Button></DialogFooter></DialogContent></Dialog>
+      <Dialog open={completionOpen} onOpenChange={(open) => { if (open) setCompletionOpen(true); else closeCompletionNotice(); }}><DialogContent><DialogHeader><DialogTitle>总表已更新</DialogTitle><DialogDescription>{result?.issue_count ? `还有 ${result.issue_count} 项需要人工填写。` : "全部内容已更新完成。"} 修改稿会保留与正式稿相同的数据，并标注本次更新的原值和新值。</DialogDescription></DialogHeader><DialogFooter><Button type="button" variant="outline" onClick={closeCompletionNotice}>关闭</Button></DialogFooter></DialogContent></Dialog>
     </div>
   );
 }
