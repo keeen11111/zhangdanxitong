@@ -24,6 +24,30 @@ class ModelProviderError(RuntimeError):
     """Safe, user-facing provider failure without response body or secrets."""
 
 
+# 单次模型请求的硬性超时上限：超过该值的配置会被压缩，
+# 避免"300 秒超时 × 3 次重试 = 15 分钟等待"的失败路径。
+MAX_MODEL_TIMEOUT_SECONDS = 120.0
+
+
+def check_model_connectivity(config: "ModelConfig", *, timeout_seconds: float = 15.0) -> str | None:
+    """Send one minimal real request so misconfiguration fails in seconds.
+
+    Returns None when the endpoint answers normally; otherwise a safe,
+    user-facing reason (auth failure, wrong URL, unknown model, timeout).
+    """
+    probe = config.model_copy(update={
+        "timeout_seconds": max(5.0, min(timeout_seconds, config.timeout_seconds)),
+        "max_output_tokens": 16,
+        "enable_thinking": False,
+        "reasoning_effort": "none",
+    })
+    try:
+        OpenAICompatibleProvider(probe).complete(messages=[{"role": "user", "content": "ping"}])
+    except ModelProviderError as exc:
+        return str(exc)
+    return None
+
+
 def _http_error_message(status: int) -> str:
     """Convert provider HTTP failures into actionable, secret-free messages."""
     if status in {401, 403}:
@@ -78,6 +102,11 @@ class ModelConfig(BaseModel):
             values["api_key"] = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not all(values[key] for key in ("provider", "base_url", "api_key", "model")):
             return None
+        # Clamp oversized timeouts so one slow request cannot dominate a run.
+        try:
+            values["timeout_seconds"] = str(min(float(values["timeout_seconds"]), MAX_MODEL_TIMEOUT_SECONDS))
+        except (TypeError, ValueError):
+            values["timeout_seconds"] = "90"
         # Do not permit arbitrary providers to be silently treated as the
         # OpenAI wire format; a future provider gets an explicit adapter.
         if values["provider"] != "openai_compatible":
@@ -107,7 +136,7 @@ class ModelConfig(BaseModel):
                 model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro").strip(),
                 api_style="chat_completions",
                 reasoning_effort=os.getenv("DEEPSEEK_REASONING_EFFORT", "high").strip(),
-                timeout_seconds=os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "180").strip(),
+                timeout_seconds=os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "90").strip(),
                 max_output_tokens=os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "8192").strip(),
                 enable_thinking=True,
             )
@@ -212,6 +241,12 @@ class OpenAICompatibleProvider:
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
+        if not self.config.enable_thinking and "api.deepseek.com" in self.config.base_url:
+            # deepseek-v4 系列是默认开启思考的混合推理模型，且思考 token 计入
+            # max_tokens：复杂任务思考过长会在输出正文前耗尽额度，返回空 content
+            # （finish_reason=length, content=""）。ENABLE_THINKING=false 的意图
+            # 必须显式下发 thinking 参数，API 才会真正关闭思考。
+            payload["thinking"] = {"type": "disabled"}
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -278,6 +313,12 @@ class OpenAICompatibleProvider:
             "max_tokens": self.config.max_output_tokens,
             "stream": True,
         }
+        if not self.config.enable_thinking and "api.deepseek.com" in self.config.base_url:
+            # deepseek-v4 系列是默认开启思考的混合推理模型，且思考 token 计入
+            # max_tokens：复杂任务思考过长会在输出正文前耗尽额度，返回空 content
+            # （finish_reason=length, content=""）。ENABLE_THINKING=false 的意图
+            # 必须显式下发 thinking 参数，API 才会真正关闭思考。
+            payload["thinking"] = {"type": "disabled"}
         for event in self._stream_sse_json(f"{self.config.base_url.rstrip('/')}/chat/completions", payload):
             choices = event.get("choices")
             if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):

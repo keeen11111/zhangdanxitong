@@ -47,8 +47,8 @@ import {
 import { cn } from "@/lib/utils";
 import { groupAgentItems, type AgentItemGroup } from "@/lib/agent-batching";
 import { agentActivityEventLabel, agentActivitySummary } from "@/lib/agent-activity";
-import { agentShortcutAction, canResumeDirectWrite, isResumableAgentRun, nextPendingAgentItem } from "@/lib/agent-workflow";
-import { isAgentProcessingInstruction } from "@/lib/agent-command";
+import { agentShortcutAction, canResumeDirectWrite, isResumableAgentRun, nextPendingAgentItem, visibleAgentItems } from "@/lib/agent-workflow";
+import { isAgentProcessingInstruction, isAgentStartCommand } from "@/lib/agent-command";
 import { AgentPlanConfirmation } from "./agent-plan-confirmation";
 import { AgentResultView } from "./agent-result-view";
 
@@ -68,12 +68,32 @@ const RUN_LABEL: Record<string, string> = {
 const SHOWCASE_PROJECT_IDS = new Set([
   "27fb356e0b494ac7bfd0013bd7f4aebc",
   "37f18e853f4e4a89b155bbb7c302779c",
+  "4f6d5c8b7a294e46a1f03d92c6e8b745",
 ]);
 
 const SHOWCASE_DOWNLOAD_NAMES: Record<string, string> = {
   "27fb356e0b494ac7bfd0013bd7f4aebc": "样本一_已更新_202608所属月202607_工资核算总表.xlsx",
   "37f18e853f4e4a89b155bbb7c302779c": "样本二_202608所属月202607_工资核算总表.xlsx",
+  "4f6d5c8b7a294e46a1f03d92c6e8b745": "待确定稿.xlsx",
 };
+
+// 这些状态表示后台已停、需要用户发“继续”或处理异常后才能推进。
+const RESUME_PROMPT_STATUSES = new Set(["execution_incomplete", "blocked", "failed"]);
+// 自动续跑会在数百毫秒内把可续跑的运行拉回 processing；延迟后再确认，
+// 避免和自动续跑抢跑导致误弹。
+const RESUME_PROMPT_DELAY_MS = 6000;
+
+function sendAgentSystemNotification(title: string, body: string) {
+  if (typeof window === "undefined" || !("Notification" in window)) return;
+  // 页面可见时弹窗本身已经足够醒目，只在切走页面时发系统通知。
+  if (Notification.permission !== "granted" || document.visibilityState === "visible") return;
+  try {
+    const notification = new Notification(title, { body, tag: "agent-resume-prompt" });
+    notification.onclick = () => { window.focus(); notification.close(); };
+  } catch {
+    // 通知发送失败不影响页面内弹窗。
+  }
+}
 
 function formatValue(value: unknown) {
   if (value === null || value === undefined || value === "") return "空";
@@ -89,6 +109,51 @@ function cleanAgentContent(content: string) {
     .replace(/^\s*[-*]\s+/gm, "• ");
 }
 
+// 从 Agent 消息文本中解析“③待确认 / 待确认：”段落里的每个问题。
+// 格式约定（对齐提示词的三段式输出）：问题以编号行（1. / 2. / ① 等）
+// 或换行走列，每行一个问题；下一小节标题（④或行尾）即结束。
+function parsePendingQuestions(content: string): string[] {
+  const cleaned = cleanAgentContent(content);
+  const sectionMatch = cleaned.match(/(?:③|三、)?\s*待确认[：:]?\s*([\s\S]*?)(?=\n\s*(?:④|四、|处理方式|我的理解)|$)/);
+  if (!sectionMatch) return [];
+  return sectionMatch[1]
+    .split(/\n+/)
+    .map((line) => line.replace(/^\s*(?:[0-9]{1,2}[.、）)]|[①-⑩])[.、]?\s*/, "").trim())
+    .filter((line) => line.length >= 4 && !/^(是|否|无|暂无|没有)[。.!！\s]*$/.test(line))
+    .slice(0, 6);
+}
+
+// 为单个问题生成快捷选项：从问题文字里抽取常见口径（只处理X/删除或保留/
+// A还是B），生成 2-3 个可点按钮；无法抽取时给通用三选。
+function quickOptionsForQuestion(question: string): { label: string; reply: string }[] {
+  const options: { label: string; reply: string }[] = [];
+  const scopeMatch = question.match(/只处理([^，。？?、\s]{2,10})|只写入([^，。？?、\s]{2,10})|只保留([^，。？?、\s]{2,10})/);
+  if (scopeMatch) {
+    const scope = scopeMatch[1] || scopeMatch[2] || scopeMatch[3];
+    options.push({ label: `只处理${scope}，其余删除`, reply: `只处理${scope}，名单之外的人员从总表明细中删除，人数按来源对齐。` });
+    options.push({ label: `只处理${scope}，其余保留`, reply: `只处理${scope}，名单之外的人员保留原值不动。` });
+  }
+  const eitherMatch = question.match(/(.{2,20}?)\s*还是\s*(.{2,20}?)[？?]/);
+  if (eitherMatch) {
+    const left = eitherMatch[1].trim();
+    const right = eitherMatch[2].trim();
+    options.push({ label: left.slice(-12), reply: `选${left}。` });
+    options.push({ label: right.slice(0, 12), reply: `选${right}。` });
+  }
+  if (!options.length) {
+    options.push({ label: "按 Agent 建议处理", reply: "按你建议的方式处理。" });
+    options.push({ label: "先跳过此项", reply: "此项先跳过，不写入，保留待确认。" });
+  }
+  // 去重（label + reply 均一致时）
+  const seen = new Set<string>();
+  return options.filter((option) => {
+    const key = `${option.label}|${option.reply}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 3);
+}
+
 function normaliseRun(value: AgentRun | { run?: AgentRun } | null, projectId: string) {
   if (!value) return null;
   const run = ("run" in value ? value.run : value) as AgentRun | undefined;
@@ -102,7 +167,7 @@ function statusTone(status: AgentWorkItem["status"]) {
   return "text-slate-500";
 }
 
-function AgentActivityMessage({ events, running }: { events: AgentRunEvent[]; running: boolean }) {
+function AgentActivityMessage({ events, running, stopping, stopped, onStop }: { events: AgentRunEvent[]; running: boolean; stopping?: boolean; stopped?: boolean; onStop?: () => void }) {
   const [expanded, setExpanded] = useState(true);
   const [now, setNow] = useState(() => Date.now());
   const summary = agentActivitySummary(events, running);
@@ -134,11 +199,17 @@ function AgentActivityMessage({ events, running }: { events: AgentRunEvent[]; ru
       <AgentMascot className="mt-1 h-7 w-5" />
       <div className="min-w-0 max-w-[min(740px,100%)] flex-1">
         <p className="mb-1.5 text-[11px] font-medium text-slate-400">财务 Agent</p>
-        <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-50/70">
-          <div className="flex items-center gap-2.5 px-3.5 py-3">
+        <div className="overflow-clip rounded-lg border border-slate-200 bg-slate-50/70">
+          <div className={cn("flex items-center gap-2.5 px-3.5 py-3", summary.isRunning && "sticky top-0 z-10 border-b border-slate-200 bg-slate-50/95 backdrop-blur-sm")}>
             <Activity className={cn("h-4 w-4 shrink-0 text-blue-600", summary.isRunning && "animate-pulse")} />
             <div className="min-w-0 flex-1"><p className="text-[11px] text-slate-400">当前步骤</p><p className="truncate text-sm font-medium text-slate-800">{currentLabel}</p></div>
-            <span className={cn("shrink-0 text-[11px]", summary.isRunning ? "text-blue-700" : summary.isIncomplete ? "text-amber-700" : "text-slate-400")}>{summary.isRunning ? "进行中" : summary.isIncomplete ? "未完成" : "已完成"}</span>
+            {summary.isRunning && onStop ? (
+              <button type="button" className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-600 transition-colors hover:border-red-300 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-red-400 disabled:cursor-not-allowed disabled:opacity-60" onClick={onStop} disabled={stopping} aria-label="停止本次处理">
+                {stopping ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Square className="h-3 w-3 fill-current" />}
+                {stopping ? "正在停止" : "停止"}
+              </button>
+            ) : null}
+            <span className={cn("shrink-0 text-[11px]", summary.isRunning ? (stopping ? "text-amber-700" : "text-blue-700") : stopped ? "text-slate-500" : summary.isIncomplete ? "text-amber-700" : "text-slate-400")}>{summary.isRunning ? (stopping ? "停止中" : "进行中") : stopped ? "已停止" : summary.isIncomplete ? "未完成" : "已完成"}</span>
           </div>
           <div className="flex flex-wrap gap-x-4 gap-y-1 px-3.5 pb-3 text-[11px] text-slate-500">
             <span>本阶段已用时 {formatDuration(elapsedSeconds)}</span>
@@ -287,14 +358,14 @@ function FileAttachmentList({
   if (!groups.length && !materials.length) return null;
 
   return (
-    <div className={cn("space-y-2", compact ? "" : "rounded-lg border border-slate-200 bg-slate-50/70 p-2.5", collapsible && "max-h-48 overflow-y-auto overscroll-contain")} aria-label="已上传文件">
+    <div className={cn("space-y-2", compact ? "" : "rounded-lg border border-slate-200 bg-slate-50/70 p-2.5")} aria-label="已上传文件">
       {collapsible ? (
         <button type="button" className="flex w-full items-center justify-between gap-3 rounded-lg px-1.5 py-1 text-left text-xs text-slate-600 transition-colors hover:bg-slate-100" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded}>
           <span className="flex min-w-0 items-center gap-2"><Paperclip className="h-3.5 w-3.5 shrink-0 text-slate-400" /><span className="truncate">本次文件 · {files.length + materials.length} 个</span></span>
           <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform", expanded && "rotate-180")} />
         </button>
       ) : !compact ? <p className="px-1.5 pb-0.5 text-[11px] font-medium text-slate-500">本次文件</p> : null}
-      {expanded ? <>{groups.map((group) => {
+      {expanded ? <div className={cn("space-y-2", collapsible && "max-h-64 overflow-y-auto overscroll-contain")}>{groups.map((group) => {
         const Icon = group.icon;
         return (
           <div key={group.key} className="space-y-1.5">
@@ -329,7 +400,7 @@ function FileAttachmentList({
       {materials.length ? <div className="space-y-1.5">
         <div className="flex items-center gap-1.5 px-1.5 text-[11px] font-medium text-slate-500"><FileText className="h-3.5 w-3.5 text-slate-400" />说明与手册<span className="text-slate-400">{materials.length}</span></div>
         {materials.map((material) => <div key={material.material_id} className="flex min-w-0 items-center gap-2 rounded-xl bg-white px-2.5 py-2 ring-1 ring-slate-200/80"><FileText className="h-4 w-4 shrink-0 text-slate-400" /><div className="min-w-0 flex-1"><p className="truncate text-xs font-medium text-slate-800" title={material.filename}>{material.filename}</p><p className="mt-0.5 truncate text-[11px] text-slate-400">已接收，作为公司上下文材料</p></div><span className="shrink-0 rounded-full bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 ring-1 ring-violet-100">{materialKindLabel(material.kind)}</span></div>)}
-      </div> : null}</> : null}
+      </div> : null}</div> : null}
     </div>
   );
 }
@@ -470,7 +541,10 @@ function ContextPanel({
         </section>
 
         <section className="px-5 py-5 text-[11px] leading-5 text-slate-500">
-          模型：{modelStatus?.configured ? modelStatus.model : "未连接"}<br />
+          模型：{modelStatus?.configured ? modelStatus.model : "未连接"}
+          {modelStatus?.connectivity_check ? (
+            <>（{modelStatus.connectivity_check.ok ? "连接正常" : `自检失败：${modelStatus.connectivity_check.detail}`}）</>
+          ) : null}<br />
           写入边界：Agent 提议，执行器校验后写入。<br />
           录音：仅存档，不自动转写。
         </section>
@@ -479,12 +553,79 @@ function ContextPanel({
   );
 }
 
-function MessageBubble({ message, evidence, showChoices, busy, onChoice }: {
+function PendingQuestionsCard({ content, busy, onReply }: { content: string; busy?: boolean; onReply: (reply: string) => void }) {
+  const questions = useMemo(() => parsePendingQuestions(content), [content]);
+  const [customDraft, setCustomDraft] = useState("");
+  if (!questions.length) return null;
+  // A quick reply is a one-shot action. Hide the whole card while the
+  // request is in flight so the user cannot mistake the old choices for
+  // still-pending work or submit a second answer.
+  if (busy) return null;
+  const sendAnswer = (index: number, reply: string) => {
+    onReply(`关于你的问题“${questions[index]}”：${reply}`);
+  };
+  const sendCustomAnswer = () => {
+    const reply = customDraft.trim();
+    if (!reply || busy) return;
+    onReply(reply);
+    setCustomDraft("");
+  };
+  return (
+    <div className="mt-3 rounded-xl border border-blue-200 bg-blue-50/40 p-3.5 text-left" role="group" aria-label="待确认问题">
+      <p className="text-xs font-semibold text-blue-900">请拍板以下问题（点选项或自己写）</p>
+      <div className="mt-2.5 space-y-3">
+        {questions.map((question, index) => (
+          <div key={index} className="rounded-lg border border-slate-200 bg-white p-3">
+            <p className="text-[13px] leading-6 text-slate-800">{index + 1}. {question}</p>
+            <div className="mt-2.5 flex flex-wrap gap-2">
+              {quickOptionsForQuestion(question).map((option) => (
+                <button key={option.label} type="button" onClick={() => sendAnswer(index, option.reply)} className="min-h-9 rounded-full border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-800 transition-colors hover:border-blue-400 hover:bg-blue-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500">
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3">
+        <label htmlFor="pending-custom-reply" className="sr-only">自定义回复</label>
+        <textarea
+          id="pending-custom-reply"
+          value={customDraft}
+          onChange={(event) => setCustomDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              sendCustomAnswer();
+            }
+          }}
+          disabled={busy}
+          rows={2}
+          maxLength={1000}
+          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs leading-5 text-slate-800 outline-none transition-shadow placeholder:text-slate-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:bg-slate-50"
+          placeholder="也可以直接写补充说明或对多个问题的统一口径，回车发送"
+        />
+        <button
+          type="button"
+          disabled={busy || !customDraft.trim()}
+          onClick={sendCustomAnswer}
+          className="mt-2 min-h-9 rounded-lg bg-blue-700 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-45"
+        >
+          发送补充说明
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MessageBubble({ message, evidence, showChoices, busy, onChoice, onQuickReply, isLatestAgentMessage }: {
   message: AgentMessage;
   evidence?: AgentWorkItem | null;
   showChoices?: boolean;
   busy?: boolean;
   onChoice?: (action: AgentDecisionAction, value?: string | number | boolean | null) => void;
+  onQuickReply?: (reply: string) => void;
+  isLatestAgentMessage?: boolean;
 }) {
   const isUser = message.role === "user";
   const [expanded, setExpanded] = useState(false);
@@ -502,6 +643,7 @@ function MessageBubble({ message, evidence, showChoices, busy, onChoice }: {
           {displayContent}
         </div>
         {isLongAgentMessage ? <button type="button" className="mt-2 text-xs font-medium text-blue-700 hover:text-blue-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded}>{expanded ? "收起核对详情" : "展开核对详情"}</button> : null}
+        {!isUser && isLatestAgentMessage && onQuickReply ? <PendingQuestionsCard content={message.content} busy={busy} onReply={onQuickReply} /> : null}
         {!isUser && evidence ? (
           <div className="mt-3 border-l-2 border-slate-200 pl-3 text-left">
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -512,7 +654,7 @@ function MessageBubble({ message, evidence, showChoices, busy, onChoice }: {
               <span>总表：<strong className="font-mono font-medium text-slate-800">{formatValue(evidence.current_value)}</strong></span>
               <span>建议：<strong className="font-mono font-medium text-blue-700">{formatValue(evidence.proposed_value)}</strong></span>
             </div>
-            {showChoices && evidence.status === "needs_conversation" && onChoice ? (
+            {showChoices && !busy && evidence.status === "needs_conversation" && onChoice ? (
               <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2" role="group" aria-label="选择处理方式">
                 {evidence.proposed_value !== null && evidence.proposed_value !== undefined ? <button
                   type="button"
@@ -640,11 +782,13 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   const [processEvents, setProcessEvents] = useState<AgentRunEvent[]>([]);
   const [processRevision, setProcessRevision] = useState(0);
   const [processRunning, setProcessRunning] = useState(false);
+  const [stoppingRun, setStoppingRun] = useState(false);
   const [streamStatus, setStreamStatus] = useState<string | null>(null);
   const [items, setItems] = useState<AgentWorkItem[]>([]);
   const [activeReviewId, setActiveReviewId] = useState<string | null>(null);
   const [selectedReviewIds, setSelectedReviewIds] = useState<Set<string>>(new Set());
   const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [pendingPlanInstruction, setPendingPlanInstruction] = useState("");
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -663,10 +807,21 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   const [passwordError, setPasswordError] = useState<string | null>(null);
   const [passwordSubmitting, setPasswordSubmitting] = useState(false);
   const [composerHeight, setComposerHeight] = useState(220);
+  const [resumePrompt, setResumePrompt] = useState<{ runId: string; status: string; detail: string } | null>(null);
   const masterInputRef = useRef<HTMLInputElement>(null);
+  const uploadMenuRef = useRef<HTMLDivElement>(null);
+  const prevRunStatusRef = useRef<string | null>(null);
+  const latestRunStatusRef = useRef<string | null>(null);
+  const latestRunIdRef = useRef<string | null>(null);
+  const resumePromptTimerRef = useRef<number | null>(null);
   const sourceInputRef = useRef<HTMLInputElement>(null);
   const materialInputRef = useRef<HTMLInputElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const resultAnchorRef = useRef<HTMLDivElement | null>(null);
+  // 用户是否“贴底跟随”：往上翻回看历史时暂停自动跟随，
+  // 滚回底部附近后恢复，避免阅读被新事件不断拽到底部。
+  const stickToBottomRef = useRef(true);
   const activeReviewRef = useRef<HTMLDivElement>(null);
   const composerDockRef = useRef<HTMLDivElement>(null);
   const processRefreshInFlightRef = useRef(false);
@@ -705,7 +860,52 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   }, [projectId]);
 
   useEffect(() => { void load(); }, [load]);
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [items, processEvents, run]);
+  useEffect(() => { setPendingPlanInstruction(""); }, [run?.run_id]);
+  // 模型连通性自检：配置存在时后台发一次小请求，数秒内暴露地址/密钥/模型名错误。
+  useEffect(() => {
+    if (!modelStatus?.configured || run?.execution_mode === "demo") return;
+    let disposed = false;
+    api.getAgentModelStatus(true)
+      .then((checked) => { if (!disposed) setModelStatus(checked); })
+      .catch(() => { /* 自检失败不阻塞页面，仅保持原状态 */ });
+    return () => { disposed = true; };
+  }, [modelStatus?.configured, run?.execution_mode]);
+  // 新事件/新消息只在用户贴近底部时才自动跟随；上翻回看时不打扰。
+  const handleChatScroll = useCallback(() => {
+    const element = scrollContainerRef.current;
+    if (!element) return;
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    stickToBottomRef.current = distance < 240;
+  }, []);
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [items, processEvents, run]);
+  // 结果生成后把结果面板带入视口：任务完成是用户等待的关键节点，
+  // 无论当前滚动位置如何都滚动一次，避免结果被长对话顶出视野。
+  useEffect(() => {
+    if (!runResult?.available) return;
+    window.requestAnimationFrame(() => resultAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }, [runResult?.available, runResult?.filename]);
+
+  // 上传菜单：点击菜单外任意位置或按 Escape 时关闭，避免小弹窗一直挂着。
+  useEffect(() => {
+    if (!uploadMenuOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (uploadMenuRef.current && !uploadMenuRef.current.contains(event.target as Node)) {
+        setUploadMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setUploadMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [uploadMenuOpen]);
 
   useEffect(() => {
     const element = composerDockRef.current;
@@ -782,7 +982,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   }, [projectId, run?.run_id, run?.status]);
 
   useEffect(() => {
-    const namedShowcase = project?.name === "样本一" || project?.name === "样本二";
+    const namedShowcase = project?.name === "北京" || project?.name === "样本一" || project?.name === "样本二" || project?.name === "样本四";
     const shouldResume = isResumableAgentRun(run) || (namedShowcase && run?.status === "processing");
     if (!run?.run_id || !shouldResume || autoResumeRunRef.current === run.run_id) return;
     autoResumeRunRef.current = run.run_id;
@@ -807,6 +1007,53 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     return () => { disposed = true; window.clearTimeout(timer); };
   }, [project?.name, projectId, refreshProcessEvents, run]);
 
+  // 处理从“进行中”转入“需要用户继续”且自动续跑未接管时，弹窗提醒。
+  useEffect(() => {
+    const previous = prevRunStatusRef.current;
+    prevRunStatusRef.current = run?.status ?? null;
+    latestRunStatusRef.current = run?.status ?? null;
+    latestRunIdRef.current = run?.run_id ?? null;
+    if (!run?.run_id) return;
+    const wasActive = previous === "processing" || previous === "planning";
+    if (!wasActive || !RESUME_PROMPT_STATUSES.has(run.status)) return;
+    // 用户主动停止（USER_STOPPED）是明确意图，不再弹窗催促继续，
+    // 也不发系统通知；只有 Agent 自身中断才提醒用户接管。
+    if (run.status === "execution_incomplete" && run.code === "USER_STOPPED") return;
+    const { run_id: runId, status, detail } = run;
+    if (resumePromptTimerRef.current) window.clearTimeout(resumePromptTimerRef.current);
+    resumePromptTimerRef.current = window.setTimeout(() => {
+      resumePromptTimerRef.current = null;
+      // 延迟期间自动续跑已接管（状态回到活跃）则不弹。
+      if (latestRunIdRef.current !== runId || !RESUME_PROMPT_STATUSES.has(latestRunStatusRef.current || "")) return;
+      setResumePrompt({ runId, status, detail: String(detail || "") });
+      sendAgentSystemNotification("外服账单系统", "Agent 已暂停，需要你发送“继续”才会接着处理。");
+    }, RESUME_PROMPT_DELAY_MS);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run?.run_id, run?.status, run?.updated_at]);
+
+  useEffect(() => () => {
+    if (resumePromptTimerRef.current) window.clearTimeout(resumePromptTimerRef.current);
+  }, []);
+
+  // Escape 统一关闭最上层弹层：弹窗 div 上的 onKeyDown 只在焦点位于
+  // 弹窗内时生效，而弹窗打开时焦点往往还留在背后页面，导致 Escape
+  // 无响应。这里按层叠顺序逐层关闭（密码弹窗 > 等待继续 > 文件预览 >
+  // 公司上下文 > 上传菜单），提交中或加载中的关键弹窗不响应。
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (passwordDialogOpen) { dismissPasswordDialog(); return; }
+      if (resumePrompt) { dismissResumePrompt(); return; }
+      if (previewFile) { closeFilePreview(); return; }
+      if (showContext) { setShowContext(false); return; }
+      setUploadMenuOpen(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  // 函数声明提升后在此处可安全引用；弹层开关状态是最小依赖集。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [passwordDialogOpen, passwordSubmitting, resumePrompt, previewFile, showContext]);
+
   useEffect(() => {
     if (!run?.run_id || !["completed", "published", "ready"].includes(run.status)) {
       setRunResult(null);
@@ -816,14 +1063,14 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     void api.getAgentResult(run.run_id).then((result) => {
       if (!disposed) {
         setRunResult(result.available
-          ? project?.name === "北京" && !SHOWCASE_PROJECT_IDS.has(projectId)
+          ? project?.name === "北京" && !SHOWCASE_PROJECT_IDS.has(projectId) && run.execution_mode !== "demo"
             ? { ...result, filename: "待确定稿.xlsx" }
             : result
           : null);
       }
     }).catch(() => { if (!disposed) setRunResult(null); });
     return () => { disposed = true; };
-  }, [project?.name, projectId, run?.run_id, run?.status, run?.updated_at]);
+  }, [project?.name, projectId, run?.execution_mode, run?.run_id, run?.status, run?.updated_at]);
 
   async function openFilePreview(file: FileMeta) {
     setPreviewFile(file);
@@ -840,14 +1087,27 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   }
 
   function closeFilePreview() {
-    if (previewLoading) return;
+    // 加载中同样允许关闭：预览接口卡住时用户能随时退出，
+    // 后续返回的数据因 previewFile 已清空而不会写入界面。
     setPreviewFile(null);
     setPreview(null);
     setPreviewError(null);
   }
 
+  // 双击确认替代原生 window.confirm：首次点击进入待确认状态并提示，
+  // 5 秒内再次点击才真正移除，超时自动取消。避免阻塞式对话框打断操作。
+  const pendingRemovalRef = useRef<string | null>(null);
+  const pendingRemovalTimerRef = useRef<number | null>(null);
   async function removeFile(file: FileMeta) {
-    if (!window.confirm(`确定移除“${file.original_name}”吗？`)) return;
+    if (pendingRemovalRef.current !== file.id) {
+      pendingRemovalRef.current = file.id;
+      if (pendingRemovalTimerRef.current) window.clearTimeout(pendingRemovalTimerRef.current);
+      pendingRemovalTimerRef.current = window.setTimeout(() => { pendingRemovalRef.current = null; }, 5000);
+      toast.info(`再次点击移除按钮以确认删除「${file.original_name}」`);
+      return;
+    }
+    pendingRemovalRef.current = null;
+    if (pendingRemovalTimerRef.current) { window.clearTimeout(pendingRemovalTimerRef.current); pendingRemovalTimerRef.current = null; }
     setUploading(true);
     try {
       await api.deleteFile(projectId, file.id);
@@ -876,21 +1136,22 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   // be uploaded again through the role picker before starting this flow.
   const masterFiles = useMemo(() => files.filter((file) => file.file_type === "financial_master"), [files]);
   const sourceFiles = useMemo(() => files.filter((file) => file.file_type === "financial_source"), [files]);
+  const isShowcaseProject = project?.name === "北京" || project?.name === "样本一" || project?.name === "样本二" || project?.name === "样本四";
 
   const pendingCount = items.filter((item) => item.status === "needs_conversation").length;
   const processingCount = items.filter((item) => item.status === "pending").length;
   const itemMessages = useMemo(() => {
-    const visible = items.filter((item) => item.item_id === activeItem?.item_id || item.status === "applied" || item.status === "skipped");
+    const visible = visibleAgentItems(items);
     return visible
       .flatMap((item) => (item.conversation || []).map((message) => ({ message, item })))
       .sort((a, b) => String(a.message.created_at || "").localeCompare(String(b.message.created_at || "")));
-  }, [activeItem?.item_id, items]);
+  }, [items]);
   const runMessages = useMemo(() => run?.conversation || [], [run?.conversation]);
   const hasConversation = Boolean(run || itemMessages.length);
   const activityEvents = processEvents;
 
   const startRun = useCallback(async (instruction?: string) => {
-    if (!masterFiles.length || !sourceFiles.length) {
+    if (!isShowcaseProject && (!masterFiles.length || !sourceFiles.length)) {
       toast.error(!masterFiles.length ? "请先上传一份总表" : "请至少上传一份更新表");
       return;
     }
@@ -899,17 +1160,36 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     setProcessEvents([]);
     setProcessRevision(0);
     try {
-      const started = normaliseRun(await api.startAgentRun(projectId, instruction, false, false), projectId);
+      const started = normaliseRun(await api.startAgentRun(projectId, instruction, false, isShowcaseProject), projectId);
       if (!started) throw new Error("服务未返回有效的处理批次");
       setRun(started);
-      const processing = normaliseRun(await api.processAgentRun(started.run_id), projectId);
+      const processing = normaliseRun(await api.processAgentRun(started.run_id, undefined, true), projectId);
       if (processing) setRun(processing);
       setItems(await api.listAgentItems(started.run_id));
       await refreshProcessEvents(started.run_id, true);
       toast.success("Agent 已开始解析文档并处理表格，关闭页面也会继续");
     } catch (error) { toast.error(error instanceof Error ? error.message : "Agent 启动失败"); }
     finally { setProcessRunning(false); setBusy(false); }
-  }, [masterFiles.length, projectId, refreshProcessEvents, sourceFiles.length]);
+  }, [isShowcaseProject, masterFiles.length, projectId, refreshProcessEvents, sourceFiles.length]);
+
+  async function stopRun() {
+    if (!run?.run_id || stoppingRun) return;
+    setStoppingRun(true);
+    try {
+      const stopped = normaliseRun(await api.stopAgentRun(run.run_id), projectId);
+      if (stopped) setRun(stopped);
+      await refreshProcessEvents(run.run_id);
+      toast.info(
+        stopped?.status === "execution_incomplete"
+          ? "已停止本次处理，已完成的写入和进度均已保留"
+          : "已发送停止请求，当前步骤结束后停止并保留进度",
+      );
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "停止请求失败");
+    } finally {
+      setStoppingRun(false);
+    }
+  }
 
   async function confirmMonth(selectedSteps?: string[], instruction?: string) {
     if (!run) return;
@@ -927,8 +1207,8 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     finally { setProcessRunning(false); setBusy(false); }
   }
 
-  async function replan(instruction?: string) {
-    if (!run) return;
+  async function replan(instruction?: string): Promise<boolean> {
+    if (!run) return false;
     setBusy(true);
     setProcessRunning(true);
     try {
@@ -945,18 +1225,21 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       setItems(await api.listAgentItems(run.run_id));
       await refreshProcessEvents(run.run_id);
       toast.success("处理口径已确认，Agent 正在自动继续");
+      return true;
     } catch (error) {
       if (instruction) setDraft(instruction);
       toast.error(error instanceof Error ? error.message : "处理口径确认失败");
+      return false;
     } finally { setProcessRunning(false); setBusy(false); }
   }
 
-  async function executeRun(instruction?: string) {
+  async function executeRun(instruction?: string, startProcessing = false) {
     if (!run) return;
     setBusy(true);
     setProcessRunning(true);
     try {
-      const processing = normaliseRun(await api.processAgentRun(run.run_id, instruction), projectId);
+      const effectiveInstruction = instruction || (startProcessing ? pendingPlanInstruction || undefined : undefined);
+      const processing = normaliseRun(await api.processAgentRun(run.run_id, effectiveInstruction, startProcessing), projectId);
       if (processing) setRun(processing);
       await refreshProcessEvents(run.run_id);
       setItems(await api.listAgentItems(run.run_id));
@@ -964,6 +1247,24 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     }
     catch (error) { toast.error(error instanceof Error ? error.message : "执行失败"); }
     finally { setProcessRunning(false); setBusy(false); }
+  }
+
+  function dismissResumePrompt() {
+    setResumePrompt(null);
+  }
+
+  async function continueFromResumePrompt() {
+    setResumePrompt(null);
+    await executeRun("继续");
+  }
+
+  function enableSystemNotify() {
+    if (typeof window === "undefined" || !("Notification" in window)) return;
+    if (Notification.permission !== "default") return;
+    void Notification.requestPermission().then((permission) => {
+      if (permission === "granted") toast.success("已开启系统通知，切走页面时也会提醒你");
+      else if (permission === "denied") toast.info("浏览器已拒绝通知权限，可在地址栏左侧的站点设置中重新允许");
+    });
   }
 
   async function chooseDecision(item: AgentWorkItem, action: AgentDecisionAction, selectedValue?: string | number | boolean | null, note = "") {
@@ -1079,17 +1380,121 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     }
   }
 
-  async function sendMessage() {
-    const content = draft.trim();
+  async function streamRunChat(runId: string, content: string) {
+    setBusy(true);
+    setProcessRunning(true);
+    const controller = new AbortController();
+    messageAbortControllerRef.current = controller;
+    let accepted = false;
+    setRun((current) => current ? {
+      ...current,
+      conversation: [
+        ...(current.conversation || []),
+        { role: "user", content },
+        { role: "agent", content: "" },
+      ],
+    } : current);
+    try {
+      await api.streamAgentRunMessage(runId, content, (event) => {
+        if (event.type === "message.accepted") accepted = true;
+        if (event.type === "message.status" && typeof event.payload.label === "string") {
+          setStreamStatus(event.payload.label);
+        }
+        if (event.type === "message.delta" && typeof event.payload.content === "string") {
+          setRun((current) => {
+            if (!current) return current;
+            const conversation = [...(current.conversation || [])];
+            const last = conversation.at(-1);
+            if (!last || last.role !== "agent") return current;
+            conversation[conversation.length - 1] = { ...last, content: `${last.content}${event.payload.content}` };
+            return { ...current, conversation };
+          });
+        }
+        if (event.type === "message.completed" && event.payload.message && typeof event.payload.message === "object") {
+          const message = event.payload.message as AgentMessage;
+          setRun((current) => {
+            if (!current) return current;
+            const conversation = [...(current.conversation || [])];
+            if (conversation.at(-1)?.role === "agent") conversation[conversation.length - 1] = message;
+            return { ...current, conversation };
+          });
+          setStreamStatus(null);
+        }
+      }, controller.signal);
+      await refreshProcessEvents(runId);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        if (!accepted) {
+          setRun((current) => current ? { ...current, conversation: (current.conversation || []).slice(0, -2) } : current);
+        }
+        setDraft(content);
+        setStreamStatus(null);
+        return;
+      }
+      if (!accepted) {
+        setRun((current) => current ? { ...current, conversation: (current.conversation || []).slice(0, -2) } : current);
+        setDraft(content);
+      }
+      toast.error(error instanceof Error ? error.message : "消息发送失败");
+    }
+    finally {
+      if (messageAbortControllerRef.current === controller) messageAbortControllerRef.current = null;
+      setStreamStatus(null);
+      setProcessRunning(false);
+      setBusy(false);
+    }
+  }
+
+  async function sendMessage(overrideContent?: string) {
+    // 快捷回复（待确认问题的选项/自定义答案）会传入现成文本，
+    // 与手动输入走完全相同的路由（对齐/续轮/执行/审核）。
+    const content = (overrideContent ?? draft).trim();
     if (!content || busy) return;
     setDraft("");
     if (!run) {
-      if (!masterFiles.length || !sourceFiles.length) {
+      if (!isShowcaseProject && (!masterFiles.length || !sourceFiles.length)) {
         setDraft(content);
         toast.error(!masterFiles.length ? "请先上传一份总表" : "请至少上传一份更新表");
         return;
       }
-      await startRun(content);
+      // 首条消息只创建任务并进入对齐：Agent 会基于上传文件复述它的
+      // 理解并与用户对齐颗粒度；执行由“开始处理”按钮或指令显式触发。
+      setBusy(true);
+      try {
+        const created = normaliseRun(await api.startAgentRun(projectId, content, false, isShowcaseProject), projectId);
+        if (!created) throw new Error("服务未返回有效的处理批次");
+        setRun(created);
+        await streamRunChat(created.run_id, content);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "任务创建失败");
+        setDraft(content);
+      }
+      finally { setBusy(false); }
+      return;
+    }
+    // 对齐阶段：执行尚未开始（无 workflow 启动记录、无草稿）。明确的
+    // 启动指令触发执行，其余消息一律走对齐对话。
+    if (!run.workflow?.started_at && !run.draft_filename) {
+      if (isAgentStartCommand(content)) {
+        await executeRun(undefined, true);
+        return;
+      }
+      await streamRunChat(run.run_id, content);
+      return;
+    }
+    // 下一轮：上一轮已收尾。新要求先对齐（Agent 会复述理解），明确的
+    // 启动指令（或失败后的“继续”）开启下一轮；可解析的表格指令由
+    // 后端直接执行，保持快速改数的原有能力。
+    const roundEnded = Boolean((run.workflow?.started_at || run.draft_filename)
+      && ["ready", "completed", "published", "failed"].includes(run.status));
+    if (roundEnded && !activeItem) {
+      const isNextRoundStart = isAgentStartCommand(content)
+        || (run.status === "failed" && /^(继续|恢复|续跑)$/.test(content.trim()));
+      if (isNextRoundStart) {
+        await executeRun(isAgentStartCommand(content) ? undefined : content);
+        return;
+      }
+      await streamRunChat(run.run_id, content);
       return;
     }
     // A plan is an internal backend artifact. When an older run still carries
@@ -1097,7 +1502,13 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     // execution instruction once, then resume processing; do not expose a
     // second plan-confirmation loop.
     if (run.plan_confirmation?.required && !run.plan_confirmation.confirmed) {
-      await replan(content);
+      // 计划尚未生成（例如上次模型故障中断在生成前）时，交给后台
+      // 工作流带指令重新生成，而不是确认一个不存在的计划导致 409。
+      if (run.model_plan) {
+        await replan(content);
+        return;
+      }
+      await executeRun(content);
       return;
     }
     if (isResumableAgentRun(run) && isAgentProcessingInstruction(content)) {
@@ -1108,73 +1519,8 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       await executeRun(content);
       return;
     }
-    if (!activeItem && isAgentProcessingInstruction(content)) {
-      await executeRun(content);
-      return;
-    }
     if (!activeItem) {
-      setBusy(true);
-      setProcessRunning(true);
-      const controller = new AbortController();
-      messageAbortControllerRef.current = controller;
-      let accepted = false;
-      setRun((current) => current ? {
-        ...current,
-        conversation: [
-          ...(current.conversation || []),
-          { role: "user", content },
-          { role: "agent", content: "" },
-        ],
-      } : current);
-      try {
-        await api.streamAgentRunMessage(run.run_id, content, (event) => {
-          if (event.type === "message.accepted") accepted = true;
-          if (event.type === "message.status" && typeof event.payload.label === "string") {
-            setStreamStatus(event.payload.label);
-          }
-          if (event.type === "message.delta" && typeof event.payload.content === "string") {
-            setRun((current) => {
-              if (!current) return current;
-              const conversation = [...(current.conversation || [])];
-              const last = conversation.at(-1);
-              if (!last || last.role !== "agent") return current;
-              conversation[conversation.length - 1] = { ...last, content: `${last.content}${event.payload.content}` };
-              return { ...current, conversation };
-            });
-          }
-          if (event.type === "message.completed" && event.payload.message && typeof event.payload.message === "object") {
-            const message = event.payload.message as AgentMessage;
-            setRun((current) => {
-              if (!current) return current;
-              const conversation = [...(current.conversation || [])];
-              if (conversation.at(-1)?.role === "agent") conversation[conversation.length - 1] = message;
-              return { ...current, conversation };
-            });
-            setStreamStatus(null);
-          }
-        }, controller.signal);
-        await refreshProcessEvents(run.run_id);
-      } catch (error) {
-        if (controller.signal.aborted) {
-          if (!accepted) {
-            setRun((current) => current ? { ...current, conversation: (current.conversation || []).slice(0, -2) } : current);
-          }
-          setDraft(content);
-          setStreamStatus(null);
-          return;
-        }
-        if (!accepted) {
-          setRun((current) => current ? { ...current, conversation: (current.conversation || []).slice(0, -2) } : current);
-          setDraft(content);
-        }
-        toast.error(error instanceof Error ? error.message : "消息发送失败");
-      }
-      finally {
-        if (messageAbortControllerRef.current === controller) messageAbortControllerRef.current = null;
-        setStreamStatus(null);
-        setProcessRunning(false);
-        setBusy(false);
-      }
+      await streamRunChat(run.run_id, content);
       return;
     }
     if (isResumableAgentRun(run)) {
@@ -1266,7 +1612,14 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
         }
         if (uploadResult.uploaded.length) toast.success(`已接收 ${uploadResult.uploaded.length} 份更新表`);
       }
-      await load();
+      // 上传后只刷新运行列表与上下文数据，不整体重载：用户可能正在
+      // 查看历史运行，整体 load 会把当前视图强行切回最新运行。
+      const [runsResult, memoryResult] = await Promise.allSettled([
+        api.listAgentRuns(projectId),
+        api.listAgentMemory(projectId),
+      ]);
+      if (runsResult.status === "fulfilled") setRuns(runsResult.value.items);
+      if (memoryResult.status === "fulfilled") setMemory(memoryResult.value);
     } catch (error) { toast.error(error instanceof Error ? error.message : "文件上传失败"); }
     finally { setUploading(false); }
   }
@@ -1324,12 +1677,13 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     if (!run) return;
     setBusy(true);
     try {
-      const isLegacyBeijingProject = project?.name === "北京" && !SHOWCASE_PROJECT_IDS.has(projectId);
-      const blob = isLegacyBeijingProject ? await api.downloadAgentOutput(run.run_id) : await api.downloadAcceptedAgentFinal(run.run_id);
+      const isDemoRun = run.execution_mode === "demo";
+      const isLegacyBeijingProject = project?.name === "北京" && !SHOWCASE_PROJECT_IDS.has(projectId) && !isDemoRun;
+      const blob = isLegacyBeijingProject || isDemoRun ? await api.downloadAgentOutput(run.run_id) : await api.downloadAcceptedAgentFinal(run.run_id);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = SHOWCASE_DOWNLOAD_NAMES[projectId] || (isLegacyBeijingProject ? "待确定稿.xlsx" : run.draft_filename || "正式稿.xlsx");
+      link.download = SHOWCASE_DOWNLOAD_NAMES[projectId] || (isLegacyBeijingProject ? "待确定稿.xlsx" : run.demo_result?.filename || run.draft_filename || "正式稿.xlsx");
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
       toast.success(isLegacyBeijingProject ? "待确定稿已开始下载" : "正式稿已开始下载");
@@ -1388,9 +1742,14 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   }
 
   async function switchRun(runId: string) {
-    if (!runId) return;
+    // “当前对话”指向最新一次运行；切换后清理上一轮的勾选与聚焦，
+    // 避免残留的 selectedReviewIds 指向已不存在的事项。
+    const target = runId || runs[0]?.run_id;
+    if (!target || target === run?.run_id) return;
     setBusy(true);
-    try { const selected = normaliseRun(await api.getAgentRun(runId), projectId); if (selected) { setRun(selected); setItems(await api.listAgentItems(runId)); } }
+    setActiveReviewId(null);
+    setSelectedReviewIds(new Set());
+    try { const selected = normaliseRun(await api.getAgentRun(target), projectId); if (selected) { setRun(selected); setItems(await api.listAgentItems(target)); } }
     catch (error) { toast.error(error instanceof Error ? error.message : "运行记录加载失败"); }
     finally { setBusy(false); }
   }
@@ -1398,19 +1757,31 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   if (loading) return <div className="flex min-h-[70vh] items-center justify-center text-sm text-slate-500" aria-busy="true"><Loader2 className="mr-2 h-4 w-4 animate-spin text-blue-600" />正在加载公司上下文...</div>;
 
   const runLabel = run ? RUN_LABEL[run.status] || run.status : "准备开始";
+  // 对齐阶段：任务已创建但执行尚未启动。此时说明要求会与 Agent 对话
+  // 对齐，而不是立即触发固定处理流程。
+  const inAlignment = Boolean(run && !run.workflow?.started_at && !run.draft_filename);
+  // 下一轮：上一轮已执行完（有工作流启动记录或草稿）且状态收尾。
+  // 新消息继续走对齐对话；明确的启动指令（如“开始处理”）开启下一轮，
+  // 不再展示“开始下一轮”按钮。
+  const roundEnded = Boolean(run && (run.workflow?.started_at || run.draft_filename)
+    && ["ready", "completed", "published", "failed"].includes(run.status));
+  const showStartButton = Boolean(
+    (isShowcaseProject || (masterFiles.length && sourceFiles.length))
+      && (!run || inAlignment || (isShowcaseProject && roundEnded)),
+  );
   const runDetail = streamStatus || (run?.detail && /科园固定案例|不进入模型确认流程/.test(run.detail)
     ? "文件已识别，正在准备本次处理计划"
     : run?.detail);
   const acceptedRun = Boolean(run?.draft_filename && ["passed", "reference_match", "demo_reference_match"].includes(String(run.validation?.status || "")));
-  const assistantIntro: AgentMessage = { role: "agent", content: run ? `我正在处理「${project?.name || "当前公司"}」${project?.salary_month ? ` ${project.salary_month}` : ""}。${pendingCount ? `目前需要你确认 ${pendingCount} 项。` : processingCount ? "我正在继续核对剩余人员。" : run.status === "ready" || run.status === "published" || run.status === "completed" ? "本轮处理已结束，请查看结果与校验信息。" : "请查看下方当前状态；我会自动续跑，只有影响结果的不确定事项才会向你提问。"}` : "你好，我是这家公司的财务 Agent。上传总表、来源文件和手册后，发送“开始处理”我才会开始分析和修改；只有影响结果的不确定事项才会提问。" };
+  const assistantIntro: AgentMessage = { role: "agent", content: run ? `我正在处理「${project?.name || "当前公司"}」${project?.salary_month ? ` ${project.salary_month}` : ""}。${pendingCount ? `目前需要你确认 ${pendingCount} 项。` : processingCount ? "我正在继续核对剩余人员。" : run.status === "ready" || run.status === "published" || run.status === "completed" ? "本轮处理已结束，请查看结果与校验信息。想继续调整或开始下一轮，直接说明新要求，我会复述理解；确认后发送“开始处理”。" : inAlignment ? "执行还没有开始。你可以继续说明本次处理要求，我会复述理解、和你对齐细节；确认后发送“开始处理”或点击下方按钮启动执行。" : "请查看下方当前状态；我会自动续跑，只有影响结果的不确定事项才会向你提问。"}` : "你好，我是这家公司的财务 Agent。上传总表、来源文件和手册后，先告诉我这次的处理要求，我会复述理解、和你对齐颗粒度；你说“开始处理”后我才开始分析和修改。" };
   const composer = (
     <div className="w-full max-w-[960px]">
       {files.length || materials.length ? <div className="mb-2"><FileAttachmentList files={files} materials={materials} collapsible onPreview={(file) => void openFilePreview(file)} onRemove={(file) => void removeFile(file)} /></div> : null}
       {uploadFailures.length ? <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-left" role="alert"><p className="text-xs font-medium text-amber-900">部分文件没有接收</p><ul className="mt-1 space-y-0.5 text-[11px] leading-5 text-amber-800">{uploadFailures.map((failure) => <li key={`${failure.filename}-${failure.message}`} className="truncate" title={failure.message}><span className="font-medium">{failure.filename}</span>：{failure.message}</li>)}</ul></div> : null}
-      {!run && masterFiles.length && sourceFiles.length ? <div className="mb-2 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-left" role="status"><p className="text-xs font-medium text-blue-950">文件已准备好</p><p className="mt-0.5 text-[11px] leading-5 text-blue-800">发送“开始处理”或说明你的处理要求后，Agent 才会开始分析和修改。</p></div> : null}
+      {showStartButton ? <div className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-left" role="status"><div className="min-w-0"><p className="text-xs font-medium text-blue-950">{run ? "准备开始处理" : "文件已准备好"}</p><p className="mt-0.5 text-[11px] leading-5 text-blue-800">点击后立即执行；未单独选择的待确认事项按 Agent 建议处理，已选择的事项按你的选择执行。</p></div><Button type="button" size="sm" className="h-8 shrink-0 bg-blue-700 px-3 text-xs text-white hover:bg-blue-800" onClick={() => void (run ? executeRun(pendingPlanInstruction || undefined, true) : startRun())} disabled={busy || uploading}><ArrowUp className="mr-1 h-3.5 w-3.5" />开始处理</Button></div> : null}
       {acceptedRun && run ? <div className="mb-2 flex justify-end"><Button type="button" size="sm" className="h-7 bg-blue-700 px-2.5 text-[11px] text-white hover:bg-blue-800" onClick={() => void downloadFormalResult()} disabled={busy}><Download className="mr-1 h-3 w-3" />下载正式稿</Button></div> : null}
       <div className="relative flex items-end gap-2 rounded-[28px] border border-slate-300 bg-white px-3 py-2.5 shadow-[0_6px_24px_rgba(15,23,42,0.07)] transition-shadow focus-within:border-blue-400 focus-within:shadow-[0_8px_28px_rgba(37,99,235,0.13)]">
-        <div className="relative shrink-0">
+        <div className="relative shrink-0" ref={uploadMenuRef}>
           <button type="button" className={cn("inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500", uploadMenuOpen && "bg-slate-100 text-slate-900")} onClick={() => setUploadMenuOpen((open) => !open)} disabled={uploading || busy} aria-label="添加文件" aria-expanded={uploadMenuOpen} title="添加文件"><Paperclip className="h-[18px] w-[18px]" /></button>
           {uploadMenuOpen ? (
             <div className="absolute bottom-12 left-0 z-20 w-52 rounded-xl border border-slate-200 bg-white p-1.5 shadow-[0_12px_36px_rgba(15,23,42,0.14)]" role="menu" aria-label="选择上传类型">
@@ -1423,7 +1794,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
         <input ref={masterInputRef} type="file" accept=".xlsx,.xls" className="sr-only" disabled={uploading || busy} onChange={(event) => { void uploadFiles(event.target.files, "master"); event.currentTarget.value = ""; }} />
         <input ref={sourceInputRef} type="file" multiple accept=".xlsx,.xls" className="sr-only" disabled={uploading || busy} onChange={(event) => { void uploadFiles(event.target.files, "source"); event.currentTarget.value = ""; }} />
         <input ref={materialInputRef} type="file" multiple accept=".docx,.txt,.md,.vtt,.srt,.json,.yaml,.yml" className="sr-only" disabled={uploading || busy} onChange={(event) => { void uploadFiles(event.target.files, "material"); event.currentTarget.value = ""; }} />
-        <textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} rows={2} disabled={busy} className="max-h-36 min-h-12 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-[15px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed" placeholder={!run ? "发送“开始处理”后启动，也可补充处理要求" : activeItem ? "直接回答 Agent，或补充本次处理要求" : "可以继续对话，或用自然语言让 Agent 继续修改表格"} aria-label="与财务 Agent 对话" />
+        <textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} rows={2} disabled={busy} className="max-h-36 min-h-12 flex-1 resize-none border-0 bg-transparent px-1 py-2 text-[15px] leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed" placeholder={busy ? "正在处理中，完成后即可继续输入…" : !run ? "先说明本次处理要求（我会复述理解并对齐），或直接发送“开始处理”" : inAlignment ? "继续说明或修正处理要求；对齐完成后发送“开始处理”" : roundEnded ? "说明下一轮的处理要求，或直接发送可执行的表格指令" : activeItem ? "直接回答 Agent，或补充本次处理要求" : "可以继续对话，或用自然语言让 Agent 继续修改表格"} aria-label="与财务 Agent 对话" aria-busy={busy} />
         <div className="flex shrink-0 items-center gap-1">
           {files.length ? <span className="hidden whitespace-nowrap px-2 text-[11px] text-slate-400 sm:inline">{files.length} 个文件</span> : null}
           <button type="button" className={cn("inline-flex h-10 w-10 items-center justify-center rounded-full text-white transition-colors disabled:cursor-not-allowed", messageAbortControllerRef.current ? "bg-slate-700 hover:bg-slate-800" : "bg-blue-700 hover:bg-blue-800 disabled:bg-slate-200 disabled:text-slate-400")} onClick={() => messageAbortControllerRef.current ? stopMessageGeneration() : void sendMessage()} disabled={messageAbortControllerRef.current ? false : !draft.trim() || busy} aria-label={messageAbortControllerRef.current ? "停止生成" : "发送消息"} title={messageAbortControllerRef.current ? "停止生成" : "发送消息"}>
@@ -1449,6 +1820,12 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
             {processRunning || run?.status === "processing" ? <Loader2 className="h-3 w-3 animate-spin text-blue-600" /> : <span className={cn("h-1.5 w-1.5 rounded-full", run?.status === "blocked" ? "bg-red-500" : run?.status === "published" ? "bg-emerald-500" : "bg-slate-300")} />}
             {runLabel}
           </span>
+          {(processRunning || run?.status === "processing") && run?.run_id ? (
+            <button type="button" className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 text-xs font-medium text-slate-600 transition-colors hover:border-red-300 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/40 disabled:cursor-not-allowed disabled:opacity-60" onClick={() => void stopRun()} disabled={stoppingRun} aria-label="停止本次处理" title="停止本次处理（已完成的写入会保留）">
+              {stoppingRun ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Square className="h-3 w-3 fill-current" />}
+              <span className="hidden sm:inline">{stoppingRun ? "正在停止" : "停止"}</span>
+            </button>
+          ) : null}
           <label className="relative hidden sm:block">
             <span className="sr-only">切换历史运行</span>
             <select value={run?.run_id || ""} onChange={(event) => void switchRun(event.target.value)} className="h-8 max-w-36 appearance-none border-0 bg-transparent px-2 pr-6 text-xs text-slate-500 outline-none focus:ring-2 focus:ring-blue-500/20"><option value="">当前对话</option>{runs.map((history) => <option key={history.run_id} value={history.run_id}>{history.salary_month || "本月"} · {RUN_LABEL[history.status] || history.status}</option>)}</select>
@@ -1460,7 +1837,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       </header>
 
       <main className="relative min-h-0 flex-1 overflow-hidden">
-        <div className="chat-scrollbar absolute inset-0 overflow-y-auto">
+        <div ref={scrollContainerRef} className="chat-scrollbar absolute inset-0 overflow-y-auto" onScroll={handleChatScroll}>
           {!hasConversation ? (
             <div className="flex min-h-full flex-col items-center justify-center px-5 pb-24 pt-12 text-center">
               <AgentMascot className="mb-5 h-12 w-9" priority />
@@ -1472,25 +1849,25 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
           ) : (
             <div className="mx-auto w-full max-w-4xl px-5 pt-10 sm:px-8" style={{ paddingBottom: `${Math.max(composerHeight + 32, 220)}px` }}>
               <MessageBubble message={assistantIntro} />
-              {run ? <AgentPlanConfirmation run={run} busy={busy} onCustomize={(instruction) => void replan(instruction)} /> : null}
-              <AgentActivityMessage events={activityEvents} running={processRunning || run?.status === "processing"} />
-              {runResult ? <AgentResultView result={runResult} busy={busy} onDownload={() => void downloadUpdatedWorkbook()} /> : null}
+              {run ? <AgentPlanConfirmation run={run} busy={busy} onCustomize={(instruction) => replan(instruction)} onAnswersChanged={setPendingPlanInstruction} /> : null}
+              {runResult ? <div ref={resultAnchorRef}><AgentResultView result={runResult} busy={busy} onDownload={() => void downloadUpdatedWorkbook()} /></div> : null}
               {run?.reference_result ? <section className="my-6 border border-emerald-200 bg-white p-5" aria-label="处理结果"><p className="text-sm font-semibold text-slate-900">本轮处理已完成</p><p className="mt-2 break-all text-sm text-slate-600">{run.reference_result.filename}</p><p className="mt-1 text-xs leading-5 text-slate-500">结果工作簿已校验完成，原始上传文件未被修改。</p><Button type="button" className="mt-4 bg-blue-700 text-white hover:bg-blue-800" onClick={() => void downloadKeyuanReferenceResult()} disabled={busy}><FileSpreadsheet className="mr-1.5 h-4 w-4" />下载结果表格</Button></section> : null}
               <BatchReviewPanel items={items} selectedIds={selectedReviewIds} busy={busy} onToggleItem={toggleReviewItem} onToggleGroup={toggleReviewGroup} onApply={(selectedItems, action, customValue, note) => void applyBatchDecision(selectedItems, action, customValue, note)} />
-              {runMessages.map((message, index) => <MessageBubble key={`run-${index}`} message={message} />)}
+              {runMessages.map((message, index) => <MessageBubble key={`run-${index}`} message={message} busy={busy} isLatestAgentMessage={message.role === "agent" && index === runMessages.length - 1} onQuickReply={(reply) => void sendMessage(reply)} />)}
               {itemMessages.map(({ message, item }, index) => {
                 const latestAgentMessage = [...(item.conversation || [])].reverse().find((entry) => entry.role === "agent");
                 return <div key={`${item.item_id}-${index}`} ref={item.item_id === activeItem?.item_id && message === item.conversation?.[0] ? activeReviewRef : undefined}>
                   <MessageBubble
                     message={message}
                     evidence={message.role === "agent" ? item : null}
-                    showChoices={message.role === "agent" && item.item_id === activeItem?.item_id && message === latestAgentMessage}
+                    showChoices={message.role === "agent" && item.status === "needs_conversation" && message === latestAgentMessage}
                     busy={busy}
                     onChoice={(action, value) => void chooseDecision(item, action, value)}
                   />
                 </div>;
               })}
               {runDetail ? <div role="status" className="mt-6 flex items-start gap-2 border-l-2 border-slate-300 bg-slate-50 px-3 py-2.5 text-sm leading-6 text-slate-700"><Activity className="mt-1 h-4 w-4 shrink-0 text-blue-600" />{runDetail}</div> : null}
+              <AgentActivityMessage events={activityEvents} running={processRunning || run?.status === "processing"} stopping={stoppingRun} stopped={run?.status === "execution_incomplete" && run?.code === "USER_STOPPED"} onStop={() => void stopRun()} />
               <div ref={bottomRef} />
             </div>
           )}
@@ -1498,6 +1875,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
         {hasConversation ? <div ref={composerDockRef} className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-white via-white/95 to-transparent px-5 pb-4 pt-14 sm:px-8"><div className="pointer-events-auto mx-auto w-full max-w-5xl">{composer}</div></div> : null}
       </main>
 
+      {resumePrompt ? <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/25 p-4" role="dialog" aria-modal="true" aria-label="Agent 等待继续指令" onClick={dismissResumePrompt} onKeyDown={(event) => { if (event.key === "Escape") dismissResumePrompt(); }}><div className="w-full max-w-md rounded-xl border border-amber-200 bg-white p-6 shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-600"><Activity className="h-5 w-5" /></div><div className="min-w-0 flex-1"><h2 className="text-base font-semibold text-slate-950">Agent 已暂停，等待你的指令</h2><p className="mt-1 text-sm leading-6 text-slate-500">{resumePrompt.detail || "本轮处理已中断，已完成的写入和进度均已保留。"}</p><p className="mt-1 text-xs leading-5 text-slate-400">点击“立即继续”会自动发送继续指令，从上次检查点接着处理。</p></div><button type="button" className="ml-auto inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-800" onClick={dismissResumePrompt} aria-label="关闭提醒"><X className="h-4 w-4" /></button></div><div className="mt-5 flex justify-end gap-2 border-t border-slate-100 pt-4"><Button type="button" variant="outline" onClick={dismissResumePrompt} disabled={busy}>稍后处理</Button><Button type="button" className="bg-blue-700 text-white hover:bg-blue-800" onClick={() => void continueFromResumePrompt()} disabled={busy}>{busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ArrowUp className="mr-2 h-4 w-4" />}立即继续</Button></div>{typeof window !== "undefined" && "Notification" in window && Notification.permission === "default" ? <button type="button" className="mt-3 text-xs text-slate-400 underline underline-offset-2 transition-colors hover:text-slate-600" onClick={enableSystemNotify}>切走页面时用系统通知提醒我</button> : null}</div></div> : null}
       {passwordDialogOpen ? <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/25 p-4" role="dialog" aria-modal="true" aria-labelledby="encrypted-workbook-title" aria-describedby="encrypted-workbook-description" onClick={dismissPasswordDialog} onKeyDown={(event) => { if (event.key === "Escape") dismissPasswordDialog(); }}><div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="flex items-start gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-700"><KeyRound className="h-5 w-5" /></div><div className="min-w-0"><h2 id="encrypted-workbook-title" className="text-base font-semibold text-slate-950">Excel 需要打开密码</h2><p id="encrypted-workbook-description" className="mt-1 text-sm leading-6 text-slate-500">输入后会立即重试本次文件上传。密码只在当前请求中使用，不会写入文件。</p></div><button type="button" className="ml-auto inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-800" onClick={dismissPasswordDialog} disabled={passwordSubmitting} aria-label="关闭密码输入"><X className="h-4 w-4" /></button></div><div className="mt-5 rounded-lg bg-slate-50 px-3.5 py-3"><p className="text-xs font-medium text-slate-600">待验证文件</p><ul className="mt-2 space-y-1">{passwordFiles.map((file) => <li key={`${file.name}-${file.size}-${file.lastModified}`} className="truncate text-xs text-slate-500" title={file.name}>{file.name}</li>)}</ul></div><form className="mt-5 space-y-4" onSubmit={(event) => { event.preventDefault(); void retryEncryptedUpload(); }}><div><label htmlFor="encrypted-workbook-password" className="mb-1.5 block text-sm font-medium text-slate-700">打开密码</label><input id="encrypted-workbook-password" type="password" value={passwordDraft} onChange={(event) => { setPasswordDraft(event.target.value); if (passwordError) setPasswordError(null); }} autoFocus autoComplete="off" disabled={passwordSubmitting} className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none transition-shadow placeholder:text-slate-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 disabled:bg-slate-50" placeholder="请输入 Excel 打开密码" aria-invalid={Boolean(passwordError)} aria-describedby={passwordError ? "encrypted-workbook-error" : undefined} />{passwordError ? <p id="encrypted-workbook-error" className="mt-2 flex items-center gap-1.5 text-xs text-red-600" role="alert"><AlertCircle className="h-3.5 w-3.5 shrink-0" />{passwordError}</p> : null}</div><div className="flex justify-end gap-2 border-t border-slate-100 pt-4"><Button type="button" variant="outline" onClick={dismissPasswordDialog} disabled={passwordSubmitting}>取消</Button><Button type="submit" className="bg-blue-700 text-white hover:bg-blue-800" disabled={passwordSubmitting || !passwordDraft.trim()}>{passwordSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <KeyRound className="mr-2 h-4 w-4" />}验证并继续</Button></div></form></div></div> : null}
       {showContext ? <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/20" role="dialog" aria-modal="true" aria-label="公司上下文" onClick={() => setShowContext(false)}><div className="h-full w-full max-w-sm border-l border-slate-200 bg-white shadow-xl" onClick={(event) => event.stopPropagation()}><div className="flex h-14 items-center justify-between border-b border-slate-200 px-5"><div className="flex items-center gap-2 text-sm font-semibold text-slate-900"><ShieldCheck className="h-4 w-4 text-blue-600" />公司上下文</div><button type="button" className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-800" onClick={() => setShowContext(false)} aria-label="关闭上下文"><X className="h-4 w-4" /></button></div><ContextPanel project={project} run={run} files={files} memory={memory} modelStatus={modelStatus} items={items} onPreview={(file) => void openFilePreview(file)} onRemove={(file) => void removeFile(file)} /></div></div> : null}
       <FilePreviewDrawer file={previewFile} preview={preview} loading={previewLoading} error={previewError} onClose={closeFilePreview} />

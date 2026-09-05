@@ -315,7 +315,7 @@ def test_agent_run_is_blocked_with_actionable_detail_until_files_exist(tmp_path:
     assert "上传" in result["detail"]
 
 
-def test_named_sample_project_still_requires_uploaded_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_configured_named_sample_project_can_start_without_uploaded_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import backend.routers.agent as agent
 
     monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
@@ -330,9 +330,9 @@ def test_named_sample_project_still_requires_uploaded_files(tmp_path: Path, monk
 
     result = create_agent_run(AgentRunCreateIn(project_id="project-1"), user=user, db=_Db(project))
 
-    assert result["status"] == "blocked"
-    assert "上传" in result["detail"]
-    assert "execution_mode" not in result
+    assert result["status"] == "planning"
+    assert result["execution_mode"] == "demo"
+    assert result["plan_confirmation"] == {"required": False, "confirmed": True}
 
 
 def test_message_candidate_extraction_requires_an_offered_value() -> None:

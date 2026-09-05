@@ -27,6 +27,7 @@ from backend.agent_demo import load_demo
 from backend.database import DATA_DIR, get_db, UPLOAD_DIR
 from backend.models import User, Project, UploadFile
 from backend.schemas import ProjectIn, ProjectOut, FileOut, FilePreview, FileTypeUpdateIn
+from core.document_agent.materials import MaterialKind, classify_material
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 SESSION_DIR = os.path.join(DATA_DIR, "sessions")
@@ -35,7 +36,7 @@ SESSION_DIR = os.path.join(DATA_DIR, "sessions")
 # without running a second transformation. The source remains outside the
 # runtime data directory and is served read-only through the authenticated API.
 BEIJING_SHOWCASE_WORKBOOK = Path(
-    r"D:\shixixiangMMMMMM\Fw_薪资数据-科园-7月薪资（8.14发薪）(1)\3\202608（所属月202607）-北京科园-鹤安-大药房工资核算总表-v2.xlsx"
+    r"D:\shixixiangMMMMMM\Fw_薪资数据-科园-7月薪资（8.14发薪）(1)\3\待确定稿 (6).xlsx"
 )
 
 SHOWCASE_PROJECT_LABELS = {
@@ -205,6 +206,46 @@ def _read_upload_content(upload: FastUploadFile) -> bytes:
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="单个 Excel 文件不能超过 100 MB")
     return content
+
+
+def _is_supported_material_upload(filename: str) -> bool:
+    """True when a non-Excel upload can be read as manual/transcript material."""
+    name = Path(str(filename or "")).name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        return False
+    return classify_material(name) in (MaterialKind.MANUAL, MaterialKind.TRANSCRIPT)
+
+
+def _register_material_upload(
+    file: FastUploadFile,
+    project: Project,
+    user: User,
+    db: Session,
+    started_at: float,
+) -> FileOut:
+    """Route a document dropped into the Excel upload area to agent materials.
+
+    Users naturally attach a .docx/.txt requirement note alongside the
+    workbooks.  Registering it as a material makes the full text available to
+    the alignment chat, so the agent can read, restate, and confirm the
+    requirements instead of rejecting the upload.
+    """
+    # Lazy import: agent.py holds the material storage helpers and does not
+    # import this module, so the runtime dependency stays one-directional.
+    from backend.routers.agent import upload_agent_material
+
+    material = upload_agent_material(str(project.id), file, user=user, db=db)
+    return FileOut(
+        id=str(material.get("material_id") or uuid.uuid4().hex),
+        file_type="material",
+        original_name=str(material.get("filename") or file.filename or "说明材料"),
+        sheet_name=None,
+        row_count=0,
+        col_count=0,
+        created_at=datetime.utcnow(),
+        processing_seconds=round(time.perf_counter() - started_at, 2),
+        normalization_note="已读取全文并登记为说明材料：Agent 对话会直接理解其内容并与你确认",
+    )
 
 
 def _validate_ooxml_archive(content: bytes) -> None:
@@ -744,6 +785,12 @@ def upload_file(project_id: str,
 
     started_at = time.perf_counter()
     p = _load_project_or_404(project_id, user, db)
+
+    # A document (docx/txt/md) dropped into the upload area is a requirement
+    # note, not a workbook: read it and register it as agent material instead
+    # of rejecting it, so the alignment chat can understand its full text.
+    if _is_supported_material_upload(file.filename or ""):
+        return _register_material_upload(file, p, user, db, started_at)
 
     if file_type in _SINGLE_MASTER_FILE_TYPES:
         existing_master = db.query(UploadFile).filter(

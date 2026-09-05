@@ -1,3 +1,10 @@
+param(
+    # 常驻守护模式：进程退出后自动重启（等价 PM2，零额外依赖）
+    [switch]$Watchdog,
+    # 守护巡检间隔（秒）
+    [int]$WatchdogIntervalSeconds = 5
+)
+
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -122,7 +129,7 @@ if ($env:PAYROLL_MODEL_BASE_URL -like '*api.deepseek.com*' -and $env:DEEPSEEK_AP
     $env:PAYROLL_MODEL_API_KEY = $env:DEEPSEEK_API_KEY
 }
 
-if (-not (Test-TcpPort $backendPort)) {
+function Start-Backend {
     Start-Process -FilePath $pythonExe `
         -ArgumentList @("-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1", "--port", "$backendPort") `
         -WorkingDirectory $projectRoot `
@@ -130,9 +137,8 @@ if (-not (Test-TcpPort $backendPort)) {
         -RedirectStandardError "$logRoot\backend-error.log" `
         -WindowStyle Hidden | Out-Null
 }
-Wait-TcpPort $backendPort "Backend"
 
-if (-not (Test-TcpPort $frontendPort)) {
+function Start-Frontend {
     Start-Process -FilePath $nodeExe `
         -ArgumentList @("node_modules\next\dist\bin\next", "dev", "-p", "$frontendPort") `
         -WorkingDirectory $frontendRoot `
@@ -140,7 +146,44 @@ if (-not (Test-TcpPort $frontendPort)) {
         -RedirectStandardError "$logRoot\frontend-error.log" `
         -WindowStyle Hidden | Out-Null
 }
+
+function Write-WatchdogLog([string]$Message) {
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    Add-Content -Path "$logRoot\watchdog.log" -Value $line
+}
+
+if (-not (Test-TcpPort $backendPort)) { Start-Backend }
+Wait-TcpPort $backendPort "Backend"
+
+if (-not (Test-TcpPort $frontendPort)) { Start-Frontend }
 Wait-TcpPort $frontendPort "Frontend"
 
 Write-Output "Project started: $frontendUrl"
 Write-Output "Backend: $backendUrl"
+
+if (-not $Watchdog) { exit 0 }
+
+# ---- 常驻守护 ----
+Write-Output ""
+Write-Output "Watchdog running (interval ${WatchdogIntervalSeconds}s). Keep this window open; exited services restart automatically."
+Write-WatchdogLog "watchdog started (interval ${WatchdogIntervalSeconds}s)"
+
+$restartHistory = @{ backend = @(); frontend = @() }
+while ($true) {
+    Start-Sleep -Seconds $WatchdogIntervalSeconds
+    foreach ($name in @("backend", "frontend")) {
+        $port = if ($name -eq "backend") { $backendPort } else { $frontendPort }
+        if (Test-TcpPort $port) { continue }
+        # 崩溃循环保护：2 分钟内连续崩溃 3 次则退避 60 秒，避免无限拉起
+        $now = Get-Date
+        $recent = @($restartHistory[$name] | Where-Object { ($now - $_).TotalSeconds -lt 120 })
+        if ($recent.Count -ge 3) {
+            Write-WatchdogLog "$name crashed 3 times within 2 minutes; backing off 60s. Check logs\${name}-error.log"
+            Start-Sleep -Seconds 60
+            $restartHistory[$name] = @()
+        }
+        if ($name -eq "backend") { Start-Backend } else { Start-Frontend }
+        $restartHistory[$name] = @($recent + (Get-Date))
+        Write-WatchdogLog "$name on port $port was down; restarted"
+    }
+}

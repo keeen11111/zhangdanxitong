@@ -28,8 +28,17 @@ export function isPendingAgentItem(item: AgentWorkItem) {
   return item.status === "pending" || item.status === "needs_conversation";
 }
 
+/** Keep every item in the conversation after one item is resolved. */
+export function visibleAgentItems(items: AgentWorkItem[]) {
+  return items.filter((item) =>
+    isPendingAgentItem(item) || item.status === "applied" || item.status === "skipped" || item.status === "failed",
+  );
+}
+
 export function isResumableAgentRun(run: AgentRun | null) {
-  return run?.status === "execution_incomplete";
+  // USER_STOPPED 是用户主动停止：只允许用户明确点“继续”后恢复，
+  // 绝不能被页面加载时的自动续跑悄悄重启。
+  return run?.status === "execution_incomplete" && run.code !== "USER_STOPPED";
 }
 
 export function canResumeDirectWrite(run: AgentRun | null, items: AgentWorkItem[]) {
@@ -60,6 +69,7 @@ export function agentRunLabel(run: AgentRun | null) {
   if (run.status === "blocked") return "需确认后继续";
   if (run.status === "review") return "等待逐人确认";
   if (run.status === "ready" || run.status === "completed") return "可以发布";
+  if (run.status === "execution_incomplete" && run.code === "USER_STOPPED") return "已停止，可继续";
   if (run.status === "processing" || run.status === "planning") return "Agent 正在处理";
   return "待开始";
 }

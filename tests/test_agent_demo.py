@@ -21,6 +21,31 @@ def test_demo_workflow_keeps_a_thirty_second_processing_window() -> None:
     assert agent._demo_stage_delay(4) == pytest.approx(7.5)
 
 
+def test_sample_four_uses_the_requested_delivery_name_and_demo_alias() -> None:
+    import backend.routers.agent as agent
+
+    project_id = "4f6d5c8b7a294e46a1f03d92c6e8b745"
+    assert agent.DEMO_SAMPLE_ALIASES["样本四"] == project_id
+    assert agent.DEMO_SAMPLE_INFO[project_id]["label"] == "样本四"
+    assert agent.DEMO_DOWNLOAD_NAMES[project_id] == "待确定稿.xlsx"
+
+
+def test_beijing_showcase_uses_the_fixed_completed_workbook(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import backend.routers.agent as agent
+
+    reference = tmp_path / "待确定稿 (6).xlsx"
+    reference.write_bytes(b"beijing-showcase")
+    monkeypatch.setattr(agent, "BEIJING_SHOWCASE_WORKBOOK", reference)
+
+    config = agent._load_demo_for_project("tenant-a", "beijing-project", "北京")
+
+    assert config == {
+        "filename": "待确定稿.xlsx",
+        "sha256": hashlib.sha256(b"beijing-showcase").hexdigest(),
+        "_reference_path": str(reference),
+    }
+
+
 def test_keyuan_demo_script_is_not_the_agent_execution_path() -> None:
     """The old desktop automation script remains only as a legacy utility."""
     import backend.routers.agent as agent
@@ -179,3 +204,29 @@ def test_completed_demo_cannot_be_published_as_a_real_financial_result(
     saved = agent._load_run(run["run_id"], user)
     assert saved["status"] == "completed"
     assert saved["validation"]["status"] == "demo_reference_match"
+
+
+def test_configured_demo_result_uses_its_verified_copy_and_delivery_filename(
+    configured_demo: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import backend.routers.agent as agent
+
+    config = load_demo(configured_demo["root"], "tenant-a", "project-1")
+    run = _confirmed_run()
+    destination = tmp_path / "run-output.xlsx"
+    finish_demo(run, config, destination)
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
+    monkeypatch.setattr(agent, "_result_path", lambda _project, _filename: destination)
+    agent._save_run(run)
+    user = SimpleNamespace(id="user-1", tenant_id="tenant-a")
+
+    result = agent.get_agent_result(run["run_id"], user=user)
+    response = agent.download_agent_output(run["run_id"], user=user, db=None)
+
+    assert result["available"] is True
+    assert result["can_download"] is True
+    assert result["filename"] == config["filename"]
+    assert result["sha256"] == config["sha256"]
+    assert Path(response.path).resolve() == destination.resolve()
+    assert response.filename == config["filename"]
+    assert config["sha256"] in repr(run["demo_result"])

@@ -78,6 +78,46 @@ def test_turn_limit_returns_an_incomplete_execution_result() -> None:
     assert result.code == "MAX_TURNS_EXCEEDED"
 
 
+def test_repeated_structure_inspection_forces_the_model_toward_a_write() -> None:
+    """A repeated inspection gets guidance instead of ending a write task."""
+
+    class RepeatingInspectionProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            if self.turn <= 3:
+                return ModelResponse(content="继续检查结构", tool_calls=[ToolCall(
+                    call_id=f"inspect-{self.turn}", name="inspect_workbook",
+                )])
+            if self.turn == 4:
+                assert any(
+                    message.get("role") == "tool" and "重复" in str(message.get("content"))
+                    for message in messages
+                )
+                return ModelResponse(content="开始写入", tool_calls=[ToolCall(
+                    call_id="write-1", name="apply_source_cells",
+                    arguments={"changes": [{"sheet": "工资", "cell": "A1", "value": "已核对"}]},
+                )])
+            return ModelResponse(content="已完成写入")
+
+    registry = ToolRegistry()
+    inspections: list[bool] = []
+    registry.register("inspect_workbook", lambda: inspections.append(True) or {"sheets": []})
+    registry.register("apply_source_cells", lambda changes: {"updates": changes})
+    result = ModelOrchestrator(
+        provider=RepeatingInspectionProvider(), registry=registry, max_turns=6,
+    ).run(run_id="run-1", messages=[{"role": "user", "content": "继续"}], tools=[])
+
+    assert result.status == "completed"
+    assert inspections == [True, True]
+    assert any(
+        event.type == "tool_result" and "重复" in str(event.payload.get("error") or "")
+        for event in result.events
+    )
+
+
 def test_orchestrator_allows_a_project_to_finish_after_eight_tool_turns() -> None:
     class LongRunningProvider:
         def __init__(self) -> None:
@@ -135,6 +175,220 @@ def test_orchestrator_emits_each_event_before_the_next_model_turn() -> None:
     ]
 
 
+def test_orchestrator_read_call_limit_forces_write_phase_after_cap() -> None:
+    class ReadForeverProvider:
+        """Ignores guidance and keeps requesting data reads long past the cap."""
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            return ModelResponse(content="再读一次", tool_calls=[ToolCall(
+                call_id=f"read-{self.turn}", name="read_range",
+                arguments={"sheet": f"表{self.turn}"},
+            )])
+
+    executed_reads: list[str] = []
+
+    def read_range(sheet):
+        executed_reads.append(sheet)
+        return {"cells": [[sheet]]}
+
+    registry = ToolRegistry()
+    registry.register("read_range", read_range)
+    result = ModelOrchestrator(
+        provider=ReadForeverProvider(), registry=registry, max_turns=20, read_call_limit=3,
+    ).run(run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[])
+
+    # 前 3 次数据读取真实执行，之后的读取全部被拒绝且不再触达工具本体。
+    assert executed_reads == ["表1", "表2", "表3"]
+    assert any(
+        event.type == "tool_result"
+        and "读取阶段已结束" in str(event.payload.get("error") or "")
+        for event in result.events
+    )
+
+
+def test_orchestrator_read_cap_ignores_structure_inspection() -> None:
+    """inspect/find_table 等结构探查不占读取额度：额度只留给数据读取。"""
+
+    class InspectForeverProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            if self.turn > 5:
+                return ModelResponse(content="结构核对完成")
+            return ModelResponse(content="查看结构", tool_calls=[ToolCall(
+                call_id=f"inspect-{self.turn}", name="inspect_workbook",
+                arguments={"attempt": self.turn},
+            )])
+
+    executed = []
+
+    registry = ToolRegistry()
+    registry.register("inspect_workbook", lambda **kwargs: executed.append(kwargs) or {"sheets": []})
+    result = ModelOrchestrator(
+        provider=InspectForeverProvider(), registry=registry, max_turns=10, read_call_limit=2,
+    ).run(run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[])
+
+    assert result.status == "completed"
+    assert len(executed) == 5
+    assert not any(
+        event.type == "tool_result"
+        and "读取阶段已结束" in str(event.payload.get("error") or "")
+        for event in result.events
+    )
+
+
+def test_orchestrator_keeps_read_results_beyond_replay_window() -> None:
+    """回放窗口外的数据读取结果通过存档保留：写入阶段仍然可见。"""
+
+    class ReadThenWriteProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+            self.write_request_messages = None
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            if self.turn <= 8:
+                return ModelResponse(content="读取", tool_calls=[ToolCall(
+                    call_id=f"read-{self.turn}", name="read_range",
+                    arguments={"sheet": f"数据{self.turn}"},
+                )])
+            if self.turn == 9:
+                self.write_request_messages = messages
+                return ModelResponse(content="写入", tool_calls=[ToolCall(
+                    call_id="write-1", name="apply_source_cells",
+                    arguments={"changes": [{"sheet": "明细", "cell": "A1", "value": 1}]},
+                )])
+            return ModelResponse(content="已完成写入")
+
+    def read_range(sheet):
+        return {"cells": [[f"{sheet}-行1"], [f"{sheet}-行2"]]}
+
+    registry = ToolRegistry()
+    registry.register("read_range", read_range)
+    registry.register("apply_source_cells", lambda changes: {"updates": changes})
+    provider = ReadThenWriteProvider()
+    result = ModelOrchestrator(provider=provider, registry=registry, max_turns=12).run(
+        run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[],
+    )
+
+    assert result.status == "completed"
+    assert provider.write_request_messages is not None
+    # 第 1 轮的读取早已滑出 6 轮回放窗口，但其数据必须仍在写入请求的上下文中。
+    flat = [str(message.get("content")) for message in provider.write_request_messages]
+    assert any("数据1-行1" in content for content in flat)
+    # 窗口内的读取不重复出现（存档只接管窗口外的条目）。
+    assert sum("数据8-行1" in content for content in flat) == 1
+
+
+def test_orchestrator_empty_response_retry_preserves_read_archive() -> None:
+    """空响应后的紧凑重试只丢弃轮次回放，已读取数据必须保留。"""
+
+    class ReadEmptyWriteProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+            self.retry_request_messages = None
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            if self.turn == 1:
+                return ModelResponse(content="读取", tool_calls=[ToolCall(
+                    call_id="read-1", name="read_range", arguments={"sheet": "派遣"},
+                )])
+            if self.turn == 2:
+                return ModelResponse()  # 空响应，触发紧凑重试
+            if self.turn == 3:
+                self.retry_request_messages = messages
+                return ModelResponse(content="基于存档写入", tool_calls=[ToolCall(
+                    call_id="write-1", name="apply_source_cells",
+                    arguments={"changes": [{"sheet": "明细", "cell": "A1", "value": 1}]},
+                )])
+            return ModelResponse(content="已使用存档数据完成写入")
+
+    registry = ToolRegistry()
+    registry.register("read_range", lambda sheet: {"cells": [[f"{sheet}-人员A"], [f"{sheet}-人员B"]]})
+    registry.register("apply_source_cells", lambda changes: {"updates": changes})
+    provider = ReadEmptyWriteProvider()
+    result = ModelOrchestrator(provider=provider, registry=registry, max_turns=6).run(
+        run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[],
+    )
+
+    assert result.status == "completed"
+    assert provider.retry_request_messages is not None
+    flat = [str(message.get("content")) for message in provider.retry_request_messages]
+    assert any("派遣-人员A" in content for content in flat)
+
+
+def test_prepare_workbook_copy_does_not_count_as_data_write() -> None:
+    """建草稿副本不是数据写入：零写入不能被纯文字总结成 completed。"""
+
+    class CopyThenTalkProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            if self.turn == 1:
+                return ModelResponse(content="先建草稿", tool_calls=[ToolCall(
+                    call_id="copy-1", name="prepare_workbook_copy",
+                )])
+            return ModelResponse(content="我认为已经处理完成了")
+
+    registry = ToolRegistry()
+    registry.register("prepare_workbook_copy", lambda: {"status": "created"})
+    provider = CopyThenTalkProvider()
+    result = ModelOrchestrator(
+        provider=provider, registry=registry, max_turns=6, require_writes=True,
+    ).run(run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[])
+
+    # 连续 2 次催促后仍未写入，应保持可续跑而不是把 0 写入判定为完成。
+    nudge_events = [
+        event for event in result.events
+        if event.payload.get("stage") == "nudge_no_tool_call"
+    ]
+    assert len(nudge_events) == 2
+    assert provider.turn == 4  # 1 次建草稿 + 2 次被催促的纯文字 + 1 次最终接受
+    assert result.status == "execution_incomplete"
+    assert result.code == "NO_WRITES_PERFORMED"
+
+
+def test_incomplete_post_write_summary_is_continued_until_remaining_write() -> None:
+    """A preliminary row deletion must not end a multi-step workbook run."""
+
+    class DeleteThenWriteProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            if self.turn == 1:
+                return ModelResponse(content="删除多余人员", tool_calls=[ToolCall(
+                    call_id="delete-1", name="delete_rows", arguments={"change": {"sheet": "明细"}},
+                )])
+            if self.turn == 2:
+                return ModelResponse(content="The rows were deleted. Now I need to update wage fields.")
+            if self.turn == 3:
+                return ModelResponse(content="写入工资字段", tool_calls=[ToolCall(
+                    call_id="write-1", name="apply_source_cells", arguments={"changes": [{"cell": "A1"}]},
+                )])
+            return ModelResponse(content="已完成全部写入和校验")
+
+    registry = ToolRegistry()
+    registry.register("delete_rows", lambda change: {"deleted": True})
+    registry.register("apply_source_cells", lambda changes: {"updates": changes})
+    result = ModelOrchestrator(
+        provider=DeleteThenWriteProvider(), registry=registry, max_turns=6, require_writes=True,
+    ).run(run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[])
+
+    assert result.status == "completed"
+    assert any(event.payload.get("stage") == "nudge_incomplete_summary" for event in result.events)
+
+
 def test_orchestrator_stops_repeated_tool_requests_before_repeating_a_write() -> None:
     class StuckProvider:
         def complete(self, *, messages, tools):
@@ -168,15 +422,15 @@ def test_orchestrator_reports_repeated_read_without_blocking_the_run() -> None:
         def complete(self, *, messages, tools):
             self.turn += 1
             calls = [
-                ToolCall(call_id="read-a-1", name="inspect_workbook", arguments={"sheet": "工资"}),
-                ToolCall(call_id="read-b", name="inspect_workbook", arguments={"sheet": "奖金"}),
-                ToolCall(call_id="read-a-2", name="inspect_workbook", arguments={"sheet": "工资"}),
+                ToolCall(call_id="read-a-1", name="read_range", arguments={"sheet": "工资", "range": "A1:C3"}),
+                ToolCall(call_id="read-b", name="read_range", arguments={"sheet": "奖金", "range": "A1:C3"}),
+                ToolCall(call_id="read-a-2", name="read_range", arguments={"sheet": "工资", "range": "A1:C3"}),
             ]
             return ModelResponse(content="继续读取", tool_calls=[calls[self.turn - 1]])
 
     reads: list[str] = []
     registry = ToolRegistry()
-    registry.register("inspect_workbook", lambda sheet: reads.append(sheet) or {"sheet": sheet})
+    registry.register("read_range", lambda sheet, range: reads.append(sheet) or {"sheet": sheet, "range": range})
     result = ModelOrchestrator(
         provider=AlternatingReadProvider(), registry=registry, max_turns=3,
     ).run(run_id="run-1", messages=[{"role": "user", "content": "处理项目"}], tools=[])
@@ -191,6 +445,74 @@ def test_orchestrator_reports_repeated_read_without_blocking_the_run() -> None:
     )
 
 
+def test_orchestrator_allows_repeated_structural_inspection() -> None:
+    """结构探查（inspect/find_table）隔轮重复不拦截：
+
+    空响应紧凑重试后模型需要先确认草稿/结构才能继续写入；
+    拦截会造成“想看状态被拒→空响应”死循环（实发案例：rev 55，
+    turn 2 的 inspect 在 turn 7 重复时被误拦）。
+    """
+
+    class MixedInspectProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            plan = [
+                ("inspect-1", "inspect_workbook", {}),
+                ("read-1", "read_range", {"sheet": "工资", "range": "A1:C3"}),
+                ("inspect-2", "inspect_workbook", {}),
+                ("read-2", "read_range", {"sheet": "奖金", "range": "A1:C3"}),
+            ]
+            if self.turn > len(plan):
+                return ModelResponse(content="处理完成")
+            call_id, name, arguments = plan[self.turn - 1]
+            return ModelResponse(content="继续", tool_calls=[ToolCall(call_id=call_id, name=name, arguments=arguments)])
+
+    executed: list[str] = []
+    registry = ToolRegistry()
+    registry.register("inspect_workbook", lambda: executed.append("inspect") or {"sheets": []})
+    registry.register("read_range", lambda sheet, range: executed.append("read") or {"sheet": sheet, "range": range})
+    result = ModelOrchestrator(
+        provider=MixedInspectProvider(), registry=registry, max_turns=5,
+    ).run(run_id="run-inspect", messages=[{"role": "user", "content": "处理项目"}], tools=[])
+
+    # 两次 inspect 都真实执行（隔轮重复不拦截），读取正常执行
+    assert executed == ["inspect", "read", "inspect", "read"]
+    assert not any(
+        event.type == "tool_result" and "已读取过" in str(event.payload.get("error") or "")
+        for event in result.events
+    )
+
+
+def test_orchestrator_never_deduplicates_structural_inspection() -> None:
+    """相同结构探查可连续执行；它是恢复状态确认，不是大数据重读。"""
+
+    class InspectTwiceProvider:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def complete(self, *, messages, tools):
+            self.turn += 1
+            if self.turn <= 2:
+                return ModelResponse(tool_calls=[ToolCall(
+                    call_id=f"inspect-{self.turn}", name="inspect_workbook", arguments={},
+                )])
+            return ModelResponse(content="结构确认完成")
+
+    executed: list[str] = []
+    registry = ToolRegistry()
+    registry.register("inspect_workbook", lambda: executed.append("inspect") or {"sheets": []})
+
+    result = ModelOrchestrator(provider=InspectTwiceProvider(), registry=registry, max_turns=3).run(
+        run_id="run-inspect-twice", messages=[{"role": "user", "content": "继续"}], tools=[],
+    )
+
+    assert result.status == "completed"
+    assert executed == ["inspect", "inspect"]
+
+
 def test_orchestrator_keeps_model_context_bounded_for_long_projects() -> None:
     class LongProjectProvider:
         def __init__(self) -> None:
@@ -200,7 +522,7 @@ def test_orchestrator_keeps_model_context_bounded_for_long_projects() -> None:
         def complete(self, *, messages, tools):
             self.turns += 1
             self.message_counts.append(len(messages))
-            if self.turns <= 16:
+            if self.turns <= 12:
                 return ModelResponse(content="继续读取", tool_calls=[ToolCall(
                     call_id=f"call-{self.turns}", name="inspect_workbook", arguments={"attempt": self.turns},
                 )])
@@ -215,6 +537,80 @@ def test_orchestrator_keeps_model_context_bounded_for_long_projects() -> None:
 
     assert result.status == "completed"
     assert max(provider.message_counts) <= 26
+
+
+def test_orchestrator_enforces_total_context_char_budget() -> None:
+    """会话总字符预算：多轮大读取结果不得把请求撑爆模型上下文窗口。
+
+    实发案例（run 955a）：一轮 5 个 40K 读取 + 6 轮回放 + 100K 存档，
+    请求超 128K token 窗口后 DeepSeek 返回空 content，run 卡死 0 写入。
+    """
+
+    class BigReadThenWriteProvider:
+        def __init__(self) -> None:
+            self.turns = 0
+            self.total_chars: list[int] = []
+
+        def complete(self, *, messages, tools):
+            self.turns += 1
+            self.total_chars.append(sum(
+                len(str(m.get("content") or ""))
+                + sum(len(str((tc.get("function") or {}).get("arguments") or "")) for tc in m.get("tool_calls") or [])
+                for m in messages
+            ))
+            if self.turns <= 8:
+                return ModelResponse(content="继续读取", tool_calls=[ToolCall(
+                    call_id=f"read-{self.turns}", name="read_range",
+                    arguments={"sheet": f"表{self.turns}", "range": f"A{self.turns}:C{self.turns + 10}"},
+                )])
+            return ModelResponse(content="数据已读完，开始写入")
+
+    big_payload = {"rows": [["数值" + str(i)] * 8 for i in range(600)]}  # 约 30K 字符
+    registry = ToolRegistry()
+    registry.register("read_range", lambda sheet, range: big_payload)
+    provider = BigReadThenWriteProvider()
+    result = ModelOrchestrator(provider=provider, registry=registry, max_turns=10).run(
+        run_id="run-budget", messages=[{"role": "user", "content": "处理项目"}], tools=[],
+    )
+
+    assert result.status == "completed"
+    # 总字符（含 tool_call arguments）始终受预算约束（允许少量超额来自最新轮无条件保留）
+    from core.document_agent.orchestrator import CONVERSATION_TOTAL_CHAR_BUDGET
+    assert max(provider.total_chars) <= CONVERSATION_TOTAL_CHAR_BUDGET + 50_000
+
+
+def test_orchestrator_strictly_bounds_five_large_reads_from_one_turn() -> None:
+    """单轮多个 40K 读取也不能穿透总预算（run 955a 的直接复现）。"""
+
+    class FiveReadsProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.request_chars: list[int] = []
+
+        def complete(self, *, messages, tools):
+            self.calls += 1
+            self.request_chars.append(sum(len(str(message.get("content") or "")) for message in messages))
+            if self.calls == 1:
+                return ModelResponse(tool_calls=[
+                    ToolCall(
+                        call_id=f"read-{index}", name="read_range",
+                        arguments={"sheet": f"表{index}", "range": "A1:Z1000"},
+                    )
+                    for index in range(5)
+                ])
+            return ModelResponse(content="已读取并安全结束")
+
+    registry = ToolRegistry()
+    registry.register("read_range", lambda sheet, range: {"data": "数" * 40_000})
+    provider = FiveReadsProvider()
+
+    result = ModelOrchestrator(provider=provider, registry=registry, max_turns=2).run(
+        run_id="run-five-reads", messages=[{"role": "user", "content": "处理大表"}], tools=[],
+    )
+
+    from core.document_agent.orchestrator import CONVERSATION_TOTAL_CHAR_BUDGET
+    assert result.status == "completed"
+    assert max(provider.request_chars) <= CONVERSATION_TOTAL_CHAR_BUDGET
 
 
 def test_orchestrator_retries_an_empty_model_response_and_continues() -> None:

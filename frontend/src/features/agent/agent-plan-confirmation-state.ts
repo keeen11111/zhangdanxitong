@@ -2,12 +2,22 @@ export type PlanQuestionOption = { id: string; label: string; instruction: strin
 export type PlanQuestion = { id: string; title: string; question: string; options: PlanQuestionOption[] };
 export type PlanConfirmationAction = "auto_process" | "answer_questions" | "confirm_plan";
 
-function questionId(index: number) {
-  return `question-${index + 1}`;
+export function shouldShowPlanConfirmation({ required, confirmed, hasQuestions, submitting }: {
+  required: boolean;
+  confirmed: boolean;
+  hasQuestions: boolean;
+  submitting: boolean;
+}) {
+  return required && !confirmed && hasQuestions && !submitting;
+}
+
+function questionId(question: string, index: number) {
+  let hash = 0;
+  for (const character of question) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return `question-${Math.abs(hash)}-${index + 1}`;
 }
 
 export function presentPlanQuestions(questions: string[], projectMonth = "当前项目月份"): PlanQuestion[] {
-  const groups = new Map<string, string[]>();
   const category = (question: string) => {
     const lower = question.toLowerCase();
     if (lower.includes("salary_month") || question.includes("处理月份") || question.includes("项目月份")) return "处理月份";
@@ -19,41 +29,51 @@ export function presentPlanQuestions(questions: string[], projectMonth = "当前
     if (question.includes("公式") || question.includes("单元格") || question.includes("范围")) return "公式与表格结构";
     return "其他待确认事项";
   };
-  for (const question of questions) {
+  // 每个原始问题独立成卡，逐题作答：同类多问不再合并成一张卡，
+  // 避免选一个选项就被当成整组已答完而直接开始执行。
+  return questions.map((question, index) => {
     const title = category(question);
-    groups.set(title, [...(groups.get(title) || []), question]);
-  }
-  return [...groups.entries()].map(([title, details], index) => {
-    const question = details.length > 1
-      ? `共 ${details.length} 项：\n${details.map((item, detailIndex) => `${detailIndex + 1}. ${item}`).join("\n")}`
-      : details[0];
     if (title === "处理月份") {
-      return { id: questionId(index), title, question, options: [
+      return { id: questionId(question, index), title, question, options: [
         { id: "use_project_month", label: `按项目月份 ${projectMonth} 处理`, instruction: `按项目月份 ${projectMonth} 处理，不按文件名月份覆盖。` },
         { id: "use_file_month", label: "按文件月份处理", instruction: "按总表与来源文件对应的文件月份处理。" },
       ] };
     }
     if (title === "补发补扣") {
-      return { id: questionId(index), title, question, options: [
+      return { id: questionId(question, index), title, question, options: [
         { id: "leave_blank", label: "本月留空，列入待确认", instruction: "本月没有来源依据的补发补扣留空，并列入待确认。" },
         { id: "use_provided_detail", label: "使用我补充的明细", instruction: "使用我在对话中补充的本月补发补扣明细。" },
       ] };
     }
     if (title === "奖金来源") {
-      return { id: questionId(index), title, question, options: [
+      return { id: questionId(question, index), title, question, options: [
         { id: "use_latest_source", label: "继续使用现有奖金来源", instruction: "继续使用当前已提供的奖金来源表处理本月奖金。" },
         { id: "wait_for_new_source", label: "等待本月新来源", instruction: "没有本月新奖金来源时不写入，保留并列入待确认。" },
       ] };
     }
-    return { id: questionId(index), title, question, options: [
-      { id: "follow_recommendation", label: "按 Agent 建议处理", instruction: `按 Agent 对“${title}”这一类事项给出的建议统一处理。` },
-      { id: "leave_unresolved", label: "保留并列入待确认", instruction: `“${title}”这一类事项暂不写入，统一保留并列入待确认。` },
+    return { id: questionId(question, index), title, question, options: [
+      { id: "follow_recommendation", label: "按 Agent 建议处理", instruction: `按 Agent 对该事项给出的建议处理。` },
+      { id: "leave_unresolved", label: "保留并列入待确认", instruction: `该事项暂不写入，保留并列入待确认。` },
     ] };
   });
 }
 
-export function buildPlanResponse(questions: PlanQuestion[], answers: Record<string, string>, customInstruction = "") {
-  const answerText = questions.map((question) => question.options.find((option) => option.id === answers[question.id])?.instruction).filter(Boolean).join("\n");
+export function retainPlanAnswers(questions: PlanQuestion[], answers: Record<string, string>) {
+  const validIds = new Set(questions.map((question) => question.id));
+  return Object.fromEntries(Object.entries(answers).filter(([id]) => validIds.has(id)));
+}
+
+export function buildPlanResponse(questions: PlanQuestion[], answers: Record<string, string>, customInstruction = "", customAnswers: Record<string, string> = {}) {
+  const answerText = questions.map((question) => {
+    // 同类别可能有多张卡，引用具体问题文字（截断）保证指令可区分。
+    const brief = question.question.length > 60 ? `${question.question.slice(0, 60)}…` : question.question;
+    if (answers[question.id] === "custom_answer") {
+      const custom = (customAnswers[question.id] || "").trim();
+      return custom ? `关于“${brief}”：${custom}` : "";
+    }
+    const option = question.options.find((option) => option.id === answers[question.id]);
+    return option ? `关于“${brief}”：${option.instruction}` : "";
+  }).filter(Boolean).join("\n");
   return [answerText, customInstruction.trim()].filter(Boolean).join("\n").slice(0, 4000);
 }
 

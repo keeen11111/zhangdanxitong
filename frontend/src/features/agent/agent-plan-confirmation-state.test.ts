@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildPlanResponse, presentPlanQuestions, planConfirmationAction } from "./agent-plan-confirmation-state.ts";
+import { buildPlanResponse, presentPlanQuestions, planConfirmationAction, retainPlanAnswers, shouldShowPlanConfirmation } from "./agent-plan-confirmation-state.ts";
 
 test("automatically processes a plan when it has no unresolved questions", () => {
   assert.equal(planConfirmationAction({ hasQuestions: false }), "auto_process");
@@ -18,16 +18,27 @@ test("turns recurring planning questions into explicit choices instead of a free
   assert.ok(questions.every((question) => question.options.length === 2));
 });
 
-test("groups repeated issues into one category choice", () => {
+test("keeps repeated issues as separate per-question choices", () => {
   const questions = presentPlanQuestions([
     "考勤!G2 是公式，基础处理器跳过写入",
     "考勤!I2 是公式，基础处理器跳过写入",
     "考勤!J2 是公式，基础处理器跳过写入",
   ]);
-  assert.equal(questions.length, 1);
-  assert.equal(questions[0].title, "考勤数据");
-  assert.match(questions[0].question, /共 3 项/);
-  assert.equal(questions[0].options.length, 2);
+  assert.equal(questions.length, 3);
+  assert.ok(questions.every((question) => question.title === "考勤数据"));
+  assert.ok(questions.every((question) => question.options.length === 2));
+  assert.equal(questions[0].question, "考勤!G2 是公式，基础处理器跳过写入");
+  assert.equal(questions[1].question, "考勤!I2 是公式，基础处理器跳过写入");
+});
+
+test("retains choices for questions that remain after a plan refresh", () => {
+  const questions = presentPlanQuestions(["考勤!G2 是公式，基础处理器跳过写入", "考勤!I2 是公式，基础处理器跳过写入"]);
+  const retained = retainPlanAnswers(questions, {
+    [questions[0].id]: "follow_recommendation",
+    "removed-question": "leave_unresolved",
+  });
+
+  assert.deepEqual(retained, { [questions[0].id]: "follow_recommendation" });
 });
 
 test("builds one auditable response from the selected answers", () => {
@@ -41,4 +52,11 @@ test("builds one auditable response from the selected answers", () => {
 test("confirms the plan once every genuine question has an answer", () => {
   assert.equal(planConfirmationAction({ hasQuestions: true, hasUnansweredQuestions: true }), "answer_questions");
   assert.equal(planConfirmationAction({ hasQuestions: true, hasUnansweredQuestions: false }), "confirm_plan");
+});
+
+test("hides a submitted confirmation until the next run state is loaded", () => {
+  const base = { required: true, confirmed: false, hasQuestions: true };
+  assert.equal(shouldShowPlanConfirmation({ ...base, submitting: true }), false);
+  assert.equal(shouldShowPlanConfirmation({ ...base, submitting: false }), true);
+  assert.equal(shouldShowPlanConfirmation({ ...base, confirmed: true, submitting: true }), false);
 });

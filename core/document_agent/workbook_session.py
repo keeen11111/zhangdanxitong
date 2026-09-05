@@ -55,6 +55,18 @@ class RowCopyChange(BaseModel):
     copy_max_column: int = Field(ge=1, le=16_384)
 
 
+class RowDeleteChange(BaseModel):
+    """A guarded deletion of already-read rows within a worksheet."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    sheet: str = Field(min_length=1)
+    rows: list[int] = Field(min_length=1, max_length=200)
+    # 每个待删行至少给出一个锚点单元格及其当前值，证明该行确实读过且
+    # 未发生变化；锚点坐标必须位于对应待删行上。
+    expected_cells: dict[str, str | int | float | bool | None] = Field(min_length=1, max_length=400)
+
+
 class VerifiedCellValueChange(BaseModel):
     """A deterministic, stale-protected non-formula cell update."""
 
@@ -101,8 +113,10 @@ class WorkbookSession:
             raise ToolExecutionError("无法创建独立副本，请检查原件和输出目录") from exc
 
     def apply_source_cells(self, changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not 1 <= len(changes) <= 200:
-            raise ToolExecutionError("每批必须包含1至200项变更")
+        # 单批上限500格：整批校验通过后原子写入，支持“一次读全后
+        # 少量大批写入”的执行模式（23人×20字段级别一批写完）。
+        if not 1 <= len(changes) <= 500:
+            raise ToolExecutionError("每批必须包含1至500项变更")
         try:
             parsed = [SourceCellChange.model_validate(change) for change in changes]
         except ValidationError as exc:
@@ -355,6 +369,67 @@ class WorkbookSession:
         finally:
             workbook.close()
 
+    def delete_rows(self, change: dict[str, Any]) -> dict[str, Any]:
+        """Delete previously read rows from the draft after anchor verification.
+
+        Rows are removed bottom-up so earlier row numbers stay stable.  Each
+        row must be proven through an anchor cell whose current value matches,
+        and merged-cell overlaps are rejected like the insert tool.
+        """
+        try:
+            parsed = RowDeleteChange.model_validate(change)
+        except ValidationError as exc:
+            raise ToolExecutionError("删除行参数不合法") from exc
+        if len(set(parsed.rows)) != len(parsed.rows):
+            raise ToolExecutionError("待删行号重复，请去重后重试")
+        if not self.draft.is_file():
+            raise ToolExecutionError("请先创建原始总表的独立副本")
+        try:
+            workbook = openpyxl.load_workbook(self.draft, data_only=False)
+        except (OSError, ValueError, BadZipFile) as exc:
+            raise ToolExecutionError("草稿工作簿不存在或无法读取") from exc
+        try:
+            if parsed.sheet not in workbook.sheetnames:
+                raise ToolExecutionError("目标工作表不存在")
+            sheet = workbook[parsed.sheet]
+            anchor_rows: dict[int, str] = {}
+            for coordinate, expected_value in parsed.expected_cells.items():
+                if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", coordinate):
+                    raise ToolExecutionError("锚点必须是单一单元格坐标")
+                anchor_rows[sheet[coordinate].row] = coordinate
+                if sheet[coordinate].value != expected_value:
+                    raise ToolExecutionError(f"锚点 {coordinate} 的值已变化，请重新读取后再决定")
+            for row in parsed.rows:
+                if row < 1 or row > sheet.max_row:
+                    raise ToolExecutionError(f"第 {row} 行超出工作表范围")
+                if row not in anchor_rows:
+                    raise ToolExecutionError(f"第 {row} 行缺少锚点单元格，必须先读取并提供该行任一单元格的当前值")
+                if any(
+                    merged.min_row <= row <= merged.max_row
+                    for merged in sheet.merged_cells.ranges
+                ):
+                    raise ToolExecutionError(f"第 {row} 行涉及合并单元格，需人工确认后处理")
+            deleted_rows = sorted(parsed.rows, reverse=True)
+            for row in deleted_rows:
+                sheet.delete_rows(row, amount=1)
+            descriptor, temporary = tempfile.mkstemp(prefix="agent-row-delete-", suffix=".xlsx", dir=self.draft.parent)
+            os.close(descriptor)
+            temporary_path = Path(temporary)
+            try:
+                workbook.save(temporary_path)
+                os.replace(temporary_path, self.draft)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            return {
+                "sheet": parsed.sheet,
+                "deleted_rows": sorted(parsed.rows),
+                "remaining_max_row": sheet.max_row,
+            }
+        except (KeyError, ValueError, AttributeError, OSError, BadZipFile) as exc:
+            raise ToolExecutionError("删除行失败，本批未写入") from exc
+        finally:
+            workbook.close()
+
     def apply_verified_values(self, changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Apply pre-calculated values in an atomic batch for deterministic phases.
 
@@ -530,5 +605,19 @@ def row_copy_schema() -> dict[str, Any]:
         "description": "在独立草稿中插入一行并复制已核对的上一行格式与公式；不得用于合并单元格或未知模板行。",
         "parameters": {"type": "object", "additionalProperties": False,
                        "properties": {"change": RowCopyChange.model_json_schema()},
+                       "required": ["change"]},
+    }}
+
+
+def row_delete_schema() -> dict[str, Any]:
+    return {"type": "function", "function": {
+        "name": "delete_rows",
+        "description": (
+            "在独立草稿中删除已读取核对过的数据行（如总表明细中不在本次来源里的人员）。"
+            "每个待删行必须提供至少一个锚点单元格及其当前值以证明已读取；"
+            "行号从大到小内部处理，一次调用可删多行；涉及合并单元格会被拒绝。"
+        ),
+        "parameters": {"type": "object", "additionalProperties": False,
+                       "properties": {"change": RowDeleteChange.model_json_schema()},
                        "required": ["change"]},
     }}

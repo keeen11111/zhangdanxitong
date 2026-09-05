@@ -48,6 +48,37 @@ def test_parses_explicit_duty_count_instruction() -> None:
     }
 
 
+def test_parses_explicit_source_sheet_roster_scope() -> None:
+    instruction = (
+        "只处理变更文件里的派遣sheet，除此之外的人员数据不保留，不显示在生成的总表里。"
+        "目标月份明确为2026.07，最终名单以派遣sheet为准；司机和外包sheet完全不处理。"
+    )
+
+    assert parse_supported_workbook_rule(instruction) == {
+        "kind": "source_sheet_roster_sync",
+        "target_sheet": "明细",
+        "source_sheet": "派遣",
+        "source_hint": "",
+        "target_period": "2026-07",
+    }
+
+
+def test_parses_roster_scope_after_the_real_change_workbook_phrase() -> None:
+    instruction = (
+        "只处理变更表格里面的派遣sheet的人员数据，更新在总表里，但是其他sheet的人员数据完全不保留，"
+        "全部去掉，不显示。只要派遣sheet的人员"
+    )
+
+    rule = parse_supported_workbook_rule(instruction)
+
+    assert rule == {
+        "kind": "source_sheet_roster_sync",
+        "target_sheet": "明细",
+        "source_sheet": "派遣",
+        "source_hint": "",
+    }
+
+
 def test_replaces_duty_days_clears_unmatched_people_and_preserves_formulas(tmp_path: Path) -> None:
     draft_path, source_path = _workbooks(tmp_path)
 

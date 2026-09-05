@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { agentProgress, agentShortcutAction, canResumeDirectWrite, isResumableAgentRun, nextPendingAgentItem, timelineForRun } from "./agent-workflow.ts";
+import { agentProgress, agentShortcutAction, canResumeDirectWrite, isResumableAgentRun, nextPendingAgentItem, timelineForRun, visibleAgentItems } from "./agent-workflow.ts";
 import type { AgentWorkItem } from "./api";
 
 const items: AgentWorkItem[] = [
@@ -38,6 +38,16 @@ test("timeline turns unresolved people into direct review prompts", () => {
 test("an incomplete execution remains resumable without review items", () => {
   assert.equal(isResumableAgentRun({ run_id: "run", project_id: "p", status: "execution_incomplete" }), true);
   assert.equal(isResumableAgentRun({ run_id: "run", project_id: "p", status: "review" }), false);
+});
+
+test("keeps unresolved items visible when a different item is resolved", () => {
+  const reviewItems = [
+    { item_id: "resolved", status: "applied" as const },
+    { item_id: "unselected", status: "needs_conversation" as const },
+    { item_id: "pending", status: "pending" as const },
+  ];
+
+  assert.deepEqual(visibleAgentItems(reviewItems).map((item) => item.item_id), ["resolved", "unselected", "pending"]);
 });
 
 test("a confirmed review run without pending people can resume direct writing", () => {

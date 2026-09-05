@@ -3,6 +3,9 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
+
+import openpyxl
 
 import backend.routers.agent as agent
 from backend.routers.agent import _append_event, AgentMessageIn
@@ -15,17 +18,47 @@ def test_run_message_context_passes_manual_excerpt_to_model(monkeypatch) -> None
         lambda _run: [{"filename": "操作手册.docx", "kind": "manual", "excerpt": "奖金按J列填写"}],
     )
 
+    # workflow.started_at marks a run whose execution has begun; that keeps
+    # the task-level status prompt (short, read-only) instead of alignment.
     messages = agent._run_message_messages({
         "tenant_id": "tenant-a",
         "project_id": "project-a",
         "conversation": [],
         "summary": {},
+        "workflow": {"started_at": "2026-01-01T00:00:00+00:00"},
     })
     context = json.loads(messages[1]["content"])
     assert context["materials"][0]["excerpt"] == "奖金按J列填写"
     assert context["materials"][0]["text_length"] == len("奖金按J列填写")
     assert "最多回答3句、200字" in messages[0]["content"]
     assert "不要主动说明任何文档或手册的读取状态" in messages[0]["content"]
+
+
+def test_run_message_alignment_mode_restates_intent_with_workbook_headers(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(agent, "_material_context", lambda _run: [])
+    source = tmp_path / "更新表.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "更新"
+    sheet.append(["姓名", "奖金"])
+    sheet.append(["张三", 100])
+    workbook.save(source)
+
+    messages = agent._run_message_messages({
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "conversation": [{"role": "user", "content": "奖金按更新表更新，缺人的先留着"}],
+        "summary": {},
+        "master_file": "总表.xlsx",
+        "_master_path": str(tmp_path / "缺失.xlsx"),
+        "_source_paths": {"更新表.xlsx": str(source)},
+    })
+    assert "需求对齐助手" in messages[0]["content"]
+    assert "我的理解" in messages[0]["content"]
+    context = json.loads(messages[1]["content"])
+    # 读取失败的总表不进入上下文，但来源文件的结构（含表头）必须进入。
+    assert [book["filename"] for book in context["workbooks"]] == ["更新表.xlsx"]
+    assert context["workbooks"][0]["sheets"][0]["header_row"] == ["姓名", "奖金"]
 
 
 def test_save_run_uses_independent_temporary_files_for_concurrent_updates(tmp_path, monkeypatch) -> None:
@@ -190,6 +223,26 @@ def test_stale_processing_checkpoint_becomes_resumable(monkeypatch) -> None:
     assert stale["status"] == "execution_incomplete"
     assert stale["code"] == "WORKFLOW_INTERRUPTED"
     assert stale["events"][-1]["payload"]["failure_type"] == "stale_worker"
+
+
+def test_stale_active_worker_checkpoint_stops_processing(monkeypatch) -> None:
+    """事件断流超过租期时，即使 worker 标记仍在，也不能永久 processing。"""
+    run_id = "ab" * 16
+    stale = {
+        "run_id": run_id,
+        "status": "processing",
+        "updated_at": "2020-01-01T00:00:00+00:00",
+        "events": [],
+    }
+    monkeypatch.setattr(agent, "_ACTIVE_RUN_IDS", {run_id})
+
+    try:
+        assert agent._recover_stale_processing(stale) is True
+        assert stale["status"] == "execution_incomplete"
+        assert stale["code"] == "WORKER_UNRESPONSIVE"
+        assert agent.run_stop_requested(run_id) is True
+    finally:
+        agent.clear_run_stop(run_id)
 
 
 def test_sse_frame_has_an_explicit_type_and_redacts_sensitive_values() -> None:
@@ -422,6 +475,161 @@ def test_process_endpoint_clears_a_previous_interruption_code_when_resuming(tmp_
         agent._release_run_worker(run_id)
 
 
+def test_execute_endpoint_allows_manual_retry_of_a_zero_write_progress_loop(tmp_path, monkeypatch) -> None:
+    """A historical read-only loop can be retried, while preserving fail-closed blocks."""
+
+    run_id = "a2" * 16
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
+
+    class FakeThread:
+        def __init__(self, **_kwargs):
+            return None
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(agent, "Thread", FakeThread)
+    monkeypatch.setattr(agent, "_require_confirmed_plan", lambda _run: None)
+    monkeypatch.setattr(agent, "_verify_plan_files", lambda _run: None)
+    agent._save_run({
+        "run_id": run_id,
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "status": "blocked",
+        "code": "NO_PROGRESS_DETECTED",
+        "workbook_updates": None,
+        "plan_confirmation": {"required": False, "confirmed": True},
+        "month_confirmation": {"required": False, "confirmed": True},
+        "events": [],
+    })
+    agent._ACTIVE_RUN_IDS.discard(run_id)
+    try:
+        resumed = agent.execute_agent_run(
+            run_id, user=SimpleNamespace(tenant_id="tenant-a"), db=SimpleNamespace(),
+        )
+        assert resumed["status"] == "processing"
+        assert any(event["type"] == "run_started" for event in resumed["events"])
+    finally:
+        agent._release_run_worker(run_id)
+
+
+def test_process_endpoint_resets_previous_round_plan_for_next_round(tmp_path, monkeypatch) -> None:
+    run_id = "b2" * 16
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
+
+    class FakeThread:
+        def __init__(self, **_kwargs):
+            return None
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(agent, "Thread", FakeThread)
+    agent._save_run({
+        "run_id": run_id,
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "status": "completed",
+        "draft_filename": "draft.xlsx",
+        "workflow": {"started_at": "2026-01-01T00:00:00+00:00"},
+        "model_plan": {"summary": "上一轮计划", "steps": ["上一轮步骤"], "questions": [], "model": "m"},
+        "_plan_evidence_digest": "digest-old",
+        "events": [],
+    })
+    agent._ACTIVE_RUN_IDS.discard(run_id)
+    try:
+        agent.process_agent_run(
+            run_id,
+            agent.AgentProcessIn(instruction="把奖金改为按新表更新"),
+            user=SimpleNamespace(tenant_id="tenant-a"),
+        )
+        saved = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
+        # 下一轮必须丢弃上一轮计划，让工作流按新的对齐对话重新规划。
+        assert saved["model_plan"] is None
+        assert "_plan_evidence_digest" not in saved
+        assert saved["workflow"]["next_round"] is True
+        assert any(event.get("payload", {}).get("stage") == "next_round" for event in saved["events"])
+        assert any(
+            message.get("content") == "把奖金改为按新表更新"
+            for message in saved.get("conversation", [])
+            if message.get("role") == "user"
+        )
+    finally:
+        agent._release_run_worker(run_id)
+
+
+def test_alignment_phase_rule_message_stays_in_conversation(tmp_path, monkeypatch) -> None:
+    run_id = "c3" * 16
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(agent.ModelConfig, "from_env", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        agent,
+        "OpenAICompatibleProvider",
+        lambda _config: SimpleNamespace(complete=lambda **_kwargs: SimpleNamespace(content="我的理解：先对齐，再执行。")),
+    )
+    processed: list[tuple] = []
+
+    def _record_if_processed(*args: Any, **_kwargs: Any) -> None:
+        processed.append(args)
+
+    monkeypatch.setattr(agent, "process_agent_run", _record_if_processed)
+    monkeypatch.setattr(agent, "parse_supported_workbook_rule", lambda _message: {"kind": "duty_roster_name_count"})
+    agent._save_run({
+        "run_id": run_id,
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "status": "planning",
+        "events": [],
+        "conversation": [],
+    })
+
+    result = agent.message_agent_run(
+        run_id,
+        AgentMessageIn(message="把值班表出现次数填到总表"),
+        user=SimpleNamespace(tenant_id="tenant-a"),
+    )
+
+    # 对齐阶段（执行未开始）：规则式消息进入对话让模型复述理解，
+    # 不能直接触发固定流程。
+    assert processed == []
+    assert result["message"]["role"] == "agent"
+    saved = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
+    assert [message["role"] for message in saved["conversation"]] == ["user", "agent"]
+
+
+def test_change_report_groups_updates_and_announces_once() -> None:
+    run = {
+        "items": [
+            {"status": "auto_applied"},
+            {"status": "resolved"},
+            {"status": "pending"},
+        ],
+        "workbook_updates": [
+            {"sheet": "配送员值班费", "cell": "D2", "before": None, "after": 0, "rule": "值班次数"},
+            {"sheet": "配送员值班费", "cell": "D3", "before": 1, "after": 0, "rule": "值班次数"},
+            {"sheet": "工资核算", "cell": "F5", "before": 100, "after": 200, "rule": "奖金"},
+        ],
+        "conversation": [],
+    }
+    report = agent._build_change_report(run, run["workbook_updates"])
+    assert "共写入 3 处改动" in report
+    assert "配送员值班费（值班次数）：2 处" in report
+    assert "工资核算（奖金）：1 处" in report
+    assert "自动写入 1 项" in report
+    assert "经确认写入 1 项" in report
+    assert "另有 1 项待你确认" in report
+
+    # 同一版本结果只播报一次；结果变化后再次播报。
+    agent._announce_change_report(run, "sha-1")
+    assert len(run["conversation"]) == 1
+    agent._announce_change_report(run, "sha-1")
+    assert len(run["conversation"]) == 1
+    agent._announce_change_report(run, "sha-2")
+    assert len(run["conversation"]) == 2
+    assert all(message.get("kind") == "change_report" for message in run["conversation"])
+    assert len(run["change_reports"]) == 2
+
+
 def test_background_worker_records_a_sanitized_interruption_reason(tmp_path, monkeypatch) -> None:
     run_id = "b2" * 16
     monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
@@ -488,7 +696,7 @@ def test_background_workflow_reaches_a_downloadable_terminal_result(tmp_path, mo
         agent._save_run(current)
         return agent._public_run(current)
 
-    monkeypatch.setattr(agent, "execute_agent_run", fake_execute)
+    monkeypatch.setattr(agent, "_execute_agent_run_sync", fake_execute)
     agent._run_agent_workflow(run_id, "tenant-a")
 
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
@@ -504,7 +712,7 @@ def test_background_workflow_reaches_a_downloadable_terminal_result(tmp_path, mo
     )
 
 
-def test_background_workflow_automatically_continues_after_a_turn_segment(tmp_path, monkeypatch) -> None:
+def test_background_workflow_automatically_continues_after_a_zero_write_segment(tmp_path, monkeypatch) -> None:
     import openpyxl
 
     run_id = "e" * 32
@@ -533,7 +741,7 @@ def test_background_workflow_automatically_continues_after_a_turn_segment(tmp_pa
         if calls == 1:
             current.update({
                 "status": "execution_incomplete",
-                "execution_result": {"status": "execution_incomplete", "code": "MAX_TURNS_EXCEEDED"},
+                "execution_result": {"status": "execution_incomplete", "code": "NO_WRITES_PERFORMED"},
             })
             agent._save_run(current)
             return agent._public_run(current)
@@ -549,7 +757,7 @@ def test_background_workflow_automatically_continues_after_a_turn_segment(tmp_pa
         agent._save_run(current)
         return agent._public_run(current)
 
-    monkeypatch.setattr(agent, "execute_agent_run", fake_execute)
+    monkeypatch.setattr(agent, "_execute_agent_run_sync", fake_execute)
     agent._run_agent_workflow(run_id, "tenant-a")
 
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
@@ -602,7 +810,7 @@ def test_background_workflow_keeps_resuming_past_the_legacy_six_segment_limit(tm
         agent._save_run(current)
         return agent._public_run(current)
 
-    monkeypatch.setattr(agent, "execute_agent_run", fake_execute)
+    monkeypatch.setattr(agent, "_execute_agent_run_sync", fake_execute)
     agent._run_agent_workflow(run_id, "tenant-a")
 
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
@@ -648,7 +856,7 @@ def test_background_workflow_retries_transient_model_provider_error(tmp_path, mo
         agent._save_run(current)
         return agent._public_run(current)
 
-    monkeypatch.setattr(agent, "execute_agent_run", fake_execute)
+    monkeypatch.setattr(agent, "_execute_agent_run_sync", fake_execute)
     agent._run_agent_workflow(run_id, "tenant-a")
 
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))

@@ -20,12 +20,14 @@ ToolName = Literal[
     "select_sheet_mapping",
     "copy_formula_from_reference", "validate_workbook", "validate_with_officecli", "rollback_work_item",
     "publish_workbook",
+    "insert_and_copy_row", "delete_rows",
+    "run_basic_payroll_processor", "run_keyuan_workflow",
 ]
 ToolCallStatus = Literal["pending", "running", "succeeded", "failed"]
 AgentEventType = Literal[
     "run_started", "model_request", "model_response", "tool_call", "tool_result",
     "work_item_updated", "user_message", "assistant_message", "validation",
-    "needs_user_input", "run_blocked", "run_completed", "run_failed",
+    "needs_user_input", "run_blocked", "run_completed", "run_failed", "progress",
 ]
 
 

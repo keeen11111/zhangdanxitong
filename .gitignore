@@ -76,3 +76,17 @@ backend/alembic/__pycache__/
 # 临时文件
 *.tmp
 *.bak
+
+# 本地运行产物和发布包
+.playwright-cli/
+backend/data/
+output/
+outputs/
+build-portable/
+release/
+release-portable/
+tmp-*.json
+tmp-*.txt
+tmp_*.json
+tmp_*.txt
+sample*_run_id.txt

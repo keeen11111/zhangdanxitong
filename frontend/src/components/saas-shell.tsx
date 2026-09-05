@@ -3,16 +3,16 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { ChevronLeft, ChevronRight, CircleHelp, ClipboardList, FolderKanban, LogOut, Menu, Plus, Settings2, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, CircleHelp, FolderKanban, LogOut, Menu, Plus, Settings2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { api, clearAuth, getStoredUser, Project } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { mergeRecentProject, PROJECT_CREATED_EVENT } from "@/lib/project-list";
 import { AgentMascot } from "@/components/agent-mascot";
 
 const navItems = [
   { href: "/projects", label: "项目", icon: FolderKanban },
-  { href: "/work-queue", label: "待处理", icon: ClipboardList },
 ] as const;
 
 export function SaaSShell({ children }: { children: React.ReactNode }) {
@@ -33,6 +33,16 @@ export function SaaSShell({ children }: { children: React.ReactNode }) {
     });
     return () => { active = false; };
   }, [pathname]);
+
+  useEffect(() => {
+    const handleProjectCreated = (event: Event) => {
+      const project = (event as CustomEvent<Project>).detail;
+      if (!project?.id) return;
+      setProjects((current) => mergeRecentProject(current, project));
+    };
+    window.addEventListener(PROJECT_CREATED_EVENT, handleProjectCreated);
+    return () => window.removeEventListener(PROJECT_CREATED_EVENT, handleProjectCreated);
+  }, []);
 
   useEffect(() => setMobileOpen(false), [pathname]);
 

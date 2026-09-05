@@ -101,6 +101,7 @@ export interface AgentRun {
   salary_month?: string | null;
   rule_version?: string | null;
   status: AgentRunStatus;
+  code?: string | null;
   total_items?: number;
   pending_items?: number;
   high_risk_count?: number;
@@ -110,6 +111,7 @@ export interface AgentRun {
   updated_at?: string;
   detail?: string | null;
   month_confirmation?: { required: boolean; confirmed: boolean; filename_month?: string; configured_month?: string };
+  workflow?: { stage?: string; started_at?: string } | null;
   conversation?: AgentMessage[];
 }
 
@@ -234,6 +236,8 @@ export interface AgentModelStatus {
   fallback_configured?: boolean;
   fallback_provider?: string | null;
   fallback_model?: string | null;
+  /** 仅 check=true 时返回：真实小请求自检结果 */
+  connectivity_check?: { ok: boolean; detail: string };
 }
 
 export interface AgentRulePackageResult {
@@ -452,23 +456,6 @@ export interface FinancialWorkbookPublishedVersion {
     name: string;
   };
   sha256: string;
-}
-
-export interface FinancialWorkQueueItem {
-  project_id: string;
-  project_name: string;
-  salary_month: string;
-  status: "review_required" | "ready_for_release" | "blocked";
-  issue_count: number;
-  action_label: string;
-  completed_at: string;
-}
-
-export interface FinancialWorkQueue {
-  items: FinancialWorkQueueItem[];
-  total: number;
-  page: number;
-  page_size: number;
 }
 
 // ---------- 数据画像 ----------
@@ -742,7 +729,9 @@ export const api = {
   me: () => request<User>("/api/auth/me"),
 
   // ---------- Projects ----------
-  listProjects: () => request<Project[]>("/api/projects"),
+  // Project creation must be visible immediately in the persistent shell;
+  // bypass browser/desktop HTTP caches when refreshing the list.
+  listProjects: () => request<Project[]>(`/api/projects?_=${Date.now()}`, { cache: "no-store" }),
   createProject: (payload: { name: string; salary_month: string }) =>
     request<Project>("/api/projects", {
       method: "POST",
@@ -839,12 +828,14 @@ export const api = {
   confirmAgentPlan: (runId: string, selectedSteps?: string[], instruction?: string) =>
     request<Record<string, unknown>>(`/api/agent/runs/${runId}/plan`, { method: "POST", body: JSON.stringify({ confirm_month: true, confirm_plan: true, selected_steps: selectedSteps, instruction: instruction || undefined }) }).then(mapAgentRun),
   executeAgentRun: (runId: string) =>
-    request<Record<string, unknown>>(`/api/agent/runs/${runId}/execute`, { method: "POST" }, { timeoutMs: FINANCIAL_INTEGRATION_TIMEOUT_MS, timeoutMessage: "Agent 仍在处理，请刷新查看运行记录，不要重复提交" }).then(mapAgentRun),
-  processAgentRun: (runId: string, instruction?: string) =>
+    request<Record<string, unknown>>(`/api/agent/runs/${runId}/execute`, { method: "POST" }, { timeoutMs: 60_000, timeoutMessage: "执行请求已提交，正在后台处理；请刷新查看运行状态，不要重复提交" }).then(mapAgentRun),
+  processAgentRun: (runId: string, instruction?: string, startProcessing = false) =>
     request<Record<string, unknown>>(`/api/agent/runs/${runId}/process`, {
       method: "POST",
-      body: JSON.stringify(instruction ? { instruction } : {}),
+      body: JSON.stringify({ ...(instruction ? { instruction } : {}), start_processing: startProcessing }),
     }).then(mapAgentRun),
+  stopAgentRun: (runId: string) =>
+    request<Record<string, unknown>>(`/api/agent/runs/${runId}/stop`, { method: "POST" }).then(mapAgentRun),
   getAgentResult: (runId: string, page = 1, pageSize = 50) =>
     request<AgentRunResult>(`/api/agent/runs/${encodeURIComponent(runId)}/output?page=${page}&page_size=${pageSize}&_=${Date.now()}`),
   downloadAgentOutput: async (runId: string) => {
@@ -955,7 +946,7 @@ export const api = {
       `/api/agent/projects/${encodeURIComponent(projectId)}/rule-packages/${encodeURIComponent(packageId)}/activate`,
       { method: "POST", body: JSON.stringify({ confirm: true }) },
     ),
-  getAgentModelStatus: () => request<AgentModelStatus>("/api/agent/model/status"),
+  getAgentModelStatus: (check = false) => request<AgentModelStatus>(`/api/agent/model/status${check ? "?check=true" : ""}`),
 
   // ---------- Files ----------
   uploadFile: (
@@ -1006,10 +997,6 @@ export const api = {
   getFinancialWorkbookIntegrationProgress: (projectId: string) =>
     request<IntegrationProgress>(
       `/api/financial-workbooks/${projectId}/integrations/progress`,
-    ),
-  getFinancialWorkQueue: (page = 1, pageSize = 50) =>
-    request<FinancialWorkQueue>(
-      `/api/financial-workbooks/work-queue?page=${page}&page_size=${pageSize}`,
     ),
   getLatestFinancialWorkbookIntegration: (projectId: string) =>
     request<FinancialWorkbookIntegration>(

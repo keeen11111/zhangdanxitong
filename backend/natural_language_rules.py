@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 import openpyxl
 
+from backend.roster_sync import RosterSyncError, sync_master_to_source_roster
+
 
 _QUOTED_TEXT = re.compile(r'["“]([^"”]+)["”]')
 _TARGET_SHEET = re.compile(r"(?:表页|工作表|表)[—\-：:]\s*([^，,。；;\n]+)")
@@ -25,33 +27,67 @@ def _is_total(value: str) -> bool:
 
 
 def parse_supported_workbook_rule(instruction: str) -> dict[str, str] | None:
-    """Parse the first deliberately narrow duty-roster instruction.
+    """Parse one of the deliberately narrow supported workbook instructions.
 
-    This parser is intentionally not a general language-to-Excel executor.  A
-    rule is accepted only when its target sheet, destination column, source
-    duty sheet and counting operation are all explicit.
+    This parser is intentionally not a general language-to-Excel executor. A
+    rule is accepted only when its source, target and operation boundaries are
+    explicit enough for a deterministic, fail-closed update.
     """
     text = str(instruction or "")
-    if "值班" not in text or not re.search(r"出现\s*(?:的\s*)?次数", text):
+    if "值班" in text and re.search(r"出现\s*(?:的\s*)?次数", text):
+        sheet_match = _TARGET_SHEET.search(text)
+        column_match = _TARGET_COLUMN.search(text)
+        if sheet_match is None or column_match is None:
+            return None
+        target_sheet = re.split(r"\s*(?:填|将|把|清除|根据)", sheet_match.group(1).strip(), maxsplit=1)[0].strip()
+        target_column = column_match.group(1).upper()
+        if not target_sheet or "清除" not in text or "填" not in text:
+            return None
+        quoted = [value.strip() for value in _QUOTED_TEXT.findall(text) if value.strip()]
+        source_hint = next((value for value in quoted if "值班" not in value and len(_compact(value)) >= 4), "")
+        source_sheet = next((value for value in quoted if _compact(value) == "值班"), "值班")
+        return {
+            "kind": "duty_roster_name_count",
+            "target_sheet": target_sheet,
+            "target_column": target_column,
+            "source_sheet": source_sheet,
+            "source_hint": source_hint,
+        }
+
+    # Match the actual source-sheet token after phrases such as
+    # ``变更表格里面的``.  The old expression accepted only ``表`` and
+    # therefore captured the connective text (``格里面的派遣``) as part of
+    # the sheet name, making an otherwise safe deterministic rule fail to
+    # resolve its source and fall back to the model's manual write loop.
+    roster_match = re.search(
+        r"(?:只|仅)(?:需要|要|需)?(?:处理|保留|写入)\s*"
+        r"(?:来源|变更)?(?:文件|表格|表)?(?:里|中|内|的|\s)*"
+        r"([A-Za-z0-9_\-\u4e00-\u9fff]{1,20})\s*(?:sheet|表页|工作表)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    has_roster_scope = bool(re.search(r"不保留|不显示|删除|最终名单|名单.*(?:为准|一致)", text))
+    if roster_match is None or not has_roster_scope:
         return None
-    sheet_match = _TARGET_SHEET.search(text)
-    column_match = _TARGET_COLUMN.search(text)
-    if sheet_match is None or column_match is None:
-        return None
-    target_sheet = re.split(r"\s*(?:填|将|把|清除|根据)", sheet_match.group(1).strip(), maxsplit=1)[0].strip()
-    target_column = column_match.group(1).upper()
-    if not target_sheet or "清除" not in text or "填" not in text:
-        return None
-    quoted = [value.strip() for value in _QUOTED_TEXT.findall(text) if value.strip()]
-    source_hint = next((value for value in quoted if "值班" not in value and len(_compact(value)) >= 4), "")
-    source_sheet = next((value for value in quoted if _compact(value) == "值班"), "值班")
-    return {
-        "kind": "duty_roster_name_count",
-        "target_sheet": target_sheet,
-        "target_column": target_column,
+    period_match = re.search(r"(?<!\d)(20\d{2})[.\-/年](0?[1-9]|1[0-2])(?:月)?", text)
+    source_sheet = roster_match.group(1).strip()
+    # The capture can begin before a connective when the wording contains
+    # ``表格里面的``/``文件里的``.  Strip only these explicit prefixes so a
+    # real sheet name such as ``派遣`` is resolved without guessing.
+    source_sheet = re.split(
+        r"表格里面的|文件里面的|表格里的|文件里的|其中的|里面的|里的|中的",
+        source_sheet,
+    )[-1].strip()
+    source_sheet = re.sub(r"^(?:面的|的)", "", source_sheet).strip()
+    rule = {
+        "kind": "source_sheet_roster_sync",
+        "target_sheet": "明细",
         "source_sheet": source_sheet,
-        "source_hint": source_hint,
+        "source_hint": "",
     }
+    if period_match:
+        rule["target_period"] = f"{period_match.group(1)}-{int(period_match.group(2)):02d}"
+    return rule
 
 
 def _find_name_column(sheet: openpyxl.worksheet.worksheet.Worksheet, *, source: bool) -> tuple[int, int] | None:
@@ -112,7 +148,7 @@ def _rule_id(rule: Mapping[str, str], source_name: str) -> str:
 
 def apply_supported_workbook_rules(
     *, instruction: str, draft_path: Path, source_paths: Mapping[str, str | Path],
-    previous_results: list[dict[str, Any]] | None = None,
+    previous_results: list[dict[str, Any]] | None = None, target_period: str | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Apply an explicit supported instruction to the run's draft only.
 
@@ -127,7 +163,7 @@ def apply_supported_workbook_rules(
     if source is None:
         return {"results": [{
             "status": "needs_review", "kind": rule["kind"],
-            "detail": "未能从本次上传文件中唯一定位包含“值班”表页的来源文件，未写入总表。",
+            "detail": f"未能从本次上传文件中唯一定位包含“{rule['source_sheet']}”表页的来源文件，未写入总表。",
         }], "updates": []}
     source_name, source_path = source
     rule_id = _rule_id(rule, source_name)
@@ -138,6 +174,39 @@ def apply_supported_workbook_rules(
             "rule_id": rule_id, "status": "needs_review", "kind": rule["kind"],
             "detail": "当前运行尚未生成独立草稿，未写入原始总表。",
         }], "updates": []}
+
+    if rule["kind"] == "source_sheet_roster_sync":
+        effective_period = str(rule.get("target_period") or target_period or "").strip()
+        try:
+            result = sync_master_to_source_roster(
+                master_path=draft_path,
+                source_path=source_path,
+                output_path=draft_path,
+                source_sheet=rule["source_sheet"],
+                target_sheet=rule["target_sheet"],
+                target_period=effective_period,
+            )
+        except RosterSyncError as exc:
+            return {"results": [{
+                "rule_id": rule_id, "status": "needs_review", "kind": rule["kind"],
+                "detail": f"按来源名单同步未执行：{exc}",
+                "source_file": source_name, "source_sheet": rule["source_sheet"],
+            }], "updates": []}
+        return {"results": [{
+            "rule_id": rule_id,
+            "status": "applied",
+            "kind": rule["kind"],
+            "detail": (
+                f"已仅按“{rule['source_sheet']}”表页同步“{rule['target_sheet']}”："
+                f"最终 {result['employee_count']} 人，删除非名单人员 {len(result['removed_names'])} 人，"
+                "并同步重算明细派生金额及付款通知书。"
+            ),
+            "source_file": source_name,
+            **{key: result[key] for key in (
+                "source_sheet", "target_sheet", "target_period", "employee_count",
+                "retained_names", "removed_names", "unmapped_source_headers", "change_count",
+            )},
+        }], "updates": result["changes"]}
 
     source_book = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
     try:

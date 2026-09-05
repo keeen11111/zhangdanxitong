@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import openpyxl
 import pytest
@@ -77,9 +78,10 @@ def test_keyuan_batch_requires_the_project_to_use_the_payroll_period(tmp_path: P
     assert batch.matches_project_month("2026.09") is False
 
 
-def test_complete_keyuan_batch_is_not_diverted_to_model_by_stale_project_month(
+def test_complete_keyuan_batch_without_model_blocks_instead_of_auto_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """科园完整批次不再自动执行：未配置模型时阻断，固定执行器不运行。"""
     import backend.agent_execution as execution
     from core.document_agent.orchestrator import ToolRegistry
 
@@ -90,23 +92,10 @@ def test_complete_keyuan_batch_is_not_diverted_to_model_by_stale_project_month(
     workbook.save(master)
     workbook.close()
     output = tmp_path / "draft.xlsx"
+    execute_calls: list[str] = []
 
-    class FakeBatch:
-        payroll_period = "2026.07"
-
-        def matches_project_month(self, _month: str) -> bool:
-            return False
-
-    def fake_execute(*_args: object, **kwargs: object) -> dict[str, object]:
-        path = Path(kwargs["output_path"])
-        book = openpyxl.Workbook()
-        book.active.title = "工资核算"
-        book["工资核算"].insert_cols(1)
-        book["工资核算"]["A2"] = "班制"
-        for name in ("台账", "个税导出核对", "OA请款及审批"):
-            book.create_sheet(name)
-        book.save(path)
-        book.close()
+    def fake_execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+        execute_calls.append("fixed")
         return {"status": "passed", "change_count": 0, "changes": [], "issues": []}
 
     monkeypatch.setattr(execution, "execute_keyuan_batch", fake_execute)
@@ -123,12 +112,13 @@ def test_complete_keyuan_batch_is_not_diverted_to_model_by_stale_project_month(
         "messages": [],
         "model_plan": {"steps": []},
     }
-    monkeypatch.setattr(execution, "detect_keyuan_batch", lambda *_args, **_kwargs: FakeBatch())
     execution.execute_model_plan(
         run, draft=output, registry=ToolRegistry(), read_schemas=[], materials=[], rules={},
         save=lambda _run: None, emit=lambda *_args, **_kwargs: None,
     )
-    assert run["status"] == "completed"
+    assert execute_calls == []
+    assert run["status"] == "blocked"
+    assert not run.get("keyuan_workflow")
 
 
 def test_personnel_change_writer_adds_new_rows_without_duplicates() -> None:
@@ -256,8 +246,13 @@ def test_execute_keyuan_batch_stages_normalized_inputs_and_returns_audited_outpu
     assert master.is_file()
 
 
-def test_complete_keyuan_run_uses_fixed_executor_without_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_keyuan_workflow_runs_only_when_model_calls_the_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """固定执行器通过 run_keyuan_workflow 工具触发，而不是自动执行。"""
     import backend.agent_execution as execution
+    from core.document_agent.contracts import ToolCall
+    from core.document_agent.model import ModelConfig, ModelResponse
     from core.document_agent.orchestrator import ToolRegistry
 
     output = tmp_path / "Agent草稿.xlsx"
@@ -265,7 +260,7 @@ def test_complete_keyuan_run_uses_fixed_executor_without_model(tmp_path: Path, m
 
     def fake_executor(batch: object, **kwargs: object) -> dict[str, object]:
         captured["batch"] = batch
-        output_path = Path(kwargs["output_path"])
+        output_path = Path(str(kwargs["output_path"]))
         workbook = openpyxl.Workbook()
         workbook.active.title = "工资核算"
         workbook["工资核算"]["A2"] = "班制"
@@ -277,9 +272,28 @@ def test_complete_keyuan_run_uses_fixed_executor_without_model(tmp_path: Path, m
         return {"status": "passed", "change_count": 2, "changes": [{"sheet": "工资核算", "cell": "A2"}], "issues": [], "structural": {}}
 
     monkeypatch.setattr(execution, "execute_keyuan_batch", fake_executor)
-    monkeypatch.setattr(execution.ModelConfig, "from_env", lambda: None)
-    monkeypatch.setattr(execution.ModelConfig, "fallback_from_env", lambda: None)
     monkeypatch.setattr(execution, "DATA_DIR", tmp_path)
+
+    config = ModelConfig(
+        provider="openai_compatible", base_url="https://model.example/v1",
+        api_key="test-secret", model="test-model",
+    )
+    monkeypatch.setattr(execution.ModelConfig, "from_env", lambda: config)
+    monkeypatch.setattr(execution.ModelConfig, "fallback_from_env", lambda: None)
+
+    class ToolCallingProvider:
+        def __init__(self, _config: Any) -> None:
+            self.calls = 0
+
+        def complete(self, **_kwargs: Any) -> ModelResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResponse(
+                    tool_calls=[ToolCall(call_id="call-1", name="run_keyuan_workflow", arguments={})],
+                )
+            return ModelResponse(content="科园完整批次已执行完成。")
+
+    monkeypatch.setattr(execution, "OpenAICompatibleProvider", ToolCallingProvider)
 
     source_paths = _source_paths(tmp_path)
     master = tmp_path / "master.xlsx"
@@ -291,8 +305,10 @@ def test_complete_keyuan_run_uses_fixed_executor_without_model(tmp_path: Path, m
         "run_id": "r" * 32,
         "master_file": "202607（所属月202606)-北京科园-鹤安-大药房工资核算总表-v2.xlsx",
         "salary_month": "2026.07",
+        "instruction": "按科园标准流程完整处理本批薪资",
         "_master_path": str(master),
         "_source_paths": source_paths,
+        "file_manifest": [],
         "workbook_updates": [],
         "messages": [],
         "model_plan": {"steps": []},
@@ -311,15 +327,14 @@ def test_complete_keyuan_run_uses_fixed_executor_without_model(tmp_path: Path, m
 
     assert captured["batch"] is not None
     assert run["keyuan_workflow"]["status"] == "passed"
-    assert run["status"] == "completed"
-    assert run["validation"]["status"] == "passed"
+    assert run["status"] == "awaiting_review"
     assert output.is_file()
 
 
-def test_background_complete_keyuan_batch_skips_model_plan_generation(
+def test_background_workflow_does_not_inject_fixed_keyuan_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A complete batch starts the fixed executor even when no model is configured."""
+    """后台工作流不再为科园批次注入固定计划：无模型时直接阻断。"""
     import backend.routers.agent as agent
 
     run = {
@@ -337,34 +352,22 @@ def test_background_complete_keyuan_batch_skips_model_plan_generation(
         "month_confirmation": {"required": False, "confirmed": False},
     }
 
-    class FakeBatch:
-        payroll_period = "2026.07"
-
-        def matches_project_month(self, _month: str) -> bool:
-            return True
-
-    execute_calls: list[str] = []
     monkeypatch.setattr(agent, "_load_run", lambda *_args, **_kwargs: run)
     monkeypatch.setattr(agent, "_save_run", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(agent, "_material_context", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(agent, "find_basic_salary_source", lambda _paths: None)
-    monkeypatch.setattr(agent, "detect_keyuan_batch", lambda *_args, **_kwargs: FakeBatch())
+    monkeypatch.setattr(agent, "_rule_package_context", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(agent, "SessionLocal", lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(agent, "_release_run_worker", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(agent.ModelConfig, "from_env", lambda: None)
     monkeypatch.setattr(agent.ModelConfig, "fallback_from_env", lambda: None)
-    monkeypatch.setattr(agent, "confirm_agent_plan", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("model plan must be skipped")))
-
-    def fake_execute(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        execute_calls.append("fixed")
-        run["execution_result"] = {"status": "completed", "code": None, "content": "done"}
-        run["status"] = "completed"
-        return run
-
-    monkeypatch.setattr(agent, "execute_agent_run", fake_execute)
-    monkeypatch.setattr(agent, "_finalize_agent_output", lambda _run: None)
+    monkeypatch.setattr(
+        agent, "confirm_agent_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not generate a plan without a model")),
+    )
 
     agent._run_agent_workflow(run["run_id"], run["tenant_id"])
 
-    assert execute_calls == ["fixed"]
-    assert run["model_plan"]["model"] == "fixed-python-keyuan"
-    assert run["plan_confirmation"] == {"required": True, "confirmed": True}
+    assert run["status"] == "blocked"
+    assert run["code"] == "MODEL_CONFIGURATION_REQUIRED"
+    assert run.get("model_plan") is None
+    assert run["plan_confirmation"] == {"required": True, "confirmed": False}

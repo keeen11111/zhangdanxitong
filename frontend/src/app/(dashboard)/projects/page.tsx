@@ -7,6 +7,7 @@ import { ArrowRight, CalendarDays, CheckCircle2, Clock3, FileSpreadsheet, Folder
 import { toast } from "sonner";
 
 import { api, getStoredUser, Project } from "@/lib/api";
+import { PROJECT_CREATED_EVENT } from "@/lib/project-list";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -61,6 +62,7 @@ export default function ProjectsPage() {
     setCreating(true);
     try {
       const project = await api.createProject({ name: trimmed, salary_month: month.trim() });
+      window.dispatchEvent(new CustomEvent(PROJECT_CREATED_EVENT, { detail: project }));
       toast.success("已创建月度处理");
       router.push(`/projects/${project.id}/agent`);
     } catch (error) { toast.error(error instanceof Error ? error.message : "创建失败"); }
