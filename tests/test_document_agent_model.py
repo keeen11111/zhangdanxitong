@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+from io import BytesIO
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from core.document_agent.model import (
     ModelProviderError,
     ModelResponse,
     OpenAICompatibleProvider,
+    estimate_token_count,
 )
 
 
@@ -140,6 +142,48 @@ def test_openai_provider_rejects_malformed_tool_arguments(
 
     with pytest.raises(ModelProviderError, match="工具调用"):
         provider.complete(messages=[{"role": "user", "content": "继续"}], tools=[])
+
+
+@pytest.mark.parametrize("api_style", ["chat_completions", "responses"])
+def test_provider_deduplicates_tool_names_before_http_request(
+    api_style: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every request path must satisfy providers' unique-tool-name contract."""
+    provider = OpenAICompatibleProvider(ModelConfig(
+        provider="openai_compatible", base_url="https://model.example/v1",
+        api_key="test-secret", model="finance-model", api_style=api_style,
+    ))
+    captured: dict[str, Any] = {}
+
+    def fake_request(request: Any, **_kwargs: Any) -> Any:
+        captured["payload"] = json.loads(request.data)
+        if api_style == "responses":
+            return _Response({"id": "dedupe-response", "status": "completed", "output": []})
+        return _Response({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_request)
+    duplicate_tools = [
+        {"type": "function", "function": {
+            "name": "validate_workbook", "description": "first",
+            "parameters": {"type": "object", "properties": {}},
+        }},
+        {"type": "function", "function": {
+            "name": "validate_workbook", "description": "duplicate",
+            "parameters": {"type": "object", "properties": {}},
+        }},
+        {"type": "function", "function": {
+            "name": "apply_source_cells", "description": "write",
+            "parameters": {"type": "object", "properties": {}},
+        }},
+    ]
+
+    provider.complete(messages=[{"role": "user", "content": "继续"}], tools=duplicate_tools)
+
+    names = [
+        item["name"] if api_style == "responses" else item["function"]["name"]
+        for item in captured["payload"]["tools"]
+    ]
+    assert names == ["validate_workbook", "apply_source_cells"]
 
 
 def test_openai_provider_accepts_safe_python_literal_tool_arguments(
@@ -294,6 +338,39 @@ def test_responses_provider_converts_tool_outputs_for_follow_up(
 
     assert captured["payload"]["input"][0]["type"] == "function_call"
     assert captured["payload"]["input"][1]["type"] == "function_call_output"
+
+
+def test_provider_http_400_keeps_only_safe_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = OpenAICompatibleProvider(ModelConfig(
+        provider="openai_compatible", base_url="https://model.example/v1",
+        api_key="top-secret", model="finance-model",
+    ))
+    body = json.dumps({
+        "error": {"type": "invalid_request_error", "code": "context_length_exceeded", "message": "maximum context length"},
+    }).encode("utf-8")
+
+    def fail(request: Any, **_kwargs: Any) -> Any:
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+
+    with pytest.raises(ModelProviderError) as exc_info:
+        provider.complete(messages=[{"role": "user", "content": "private salary data"}])
+
+    error = exc_info.value
+    assert error.status_code == 400
+    assert error.error_type == "invalid_request_error"
+    assert error.error_code == "context_length_exceeded"
+    assert "maximum context length" in error.body_summary
+    assert "top-secret" not in repr(error.diagnostics())
+    assert "private salary data" not in repr(error.diagnostics())
+
+
+def test_token_estimate_does_not_treat_chinese_as_four_characters_per_token() -> None:
+    text = "工资明细身份核对" * 100
+
+    assert estimate_token_count(text) >= len(text)
+    assert estimate_token_count("a" * 400) == 100
 
 
 def test_typed_audit_contracts_reject_untyped_or_unsafe_payloads() -> None:

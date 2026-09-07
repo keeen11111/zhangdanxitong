@@ -47,7 +47,7 @@ import {
 import { cn } from "@/lib/utils";
 import { groupAgentItems, type AgentItemGroup } from "@/lib/agent-batching";
 import { agentActivityEventLabel, agentActivitySummary } from "@/lib/agent-activity";
-import { agentShortcutAction, canResumeDirectWrite, isResumableAgentRun, nextPendingAgentItem, visibleAgentItems } from "@/lib/agent-workflow";
+import { agentShortcutAction, canResumeDirectWrite, defaultTargetSalaryMonth, isResumableAgentRun, nextPendingAgentItem, visibleAgentItems } from "@/lib/agent-workflow";
 import { isAgentProcessingInstruction, isAgentStartCommand } from "@/lib/agent-command";
 import { AgentPlanConfirmation } from "./agent-plan-confirmation";
 import { AgentResultView } from "./agent-result-view";
@@ -79,9 +79,7 @@ const SHOWCASE_DOWNLOAD_NAMES: Record<string, string> = {
 
 // 这些状态表示后台已停、需要用户发“继续”或处理异常后才能推进。
 const RESUME_PROMPT_STATUSES = new Set(["execution_incomplete", "blocked", "failed"]);
-// 自动续跑会在数百毫秒内把可续跑的运行拉回 processing；延迟后再确认，
-// 避免和自动续跑抢跑导致误弹。
-const RESUME_PROMPT_DELAY_MS = 6000;
+const RESUME_PROMPT_DELAY_MS = 500;
 
 function sendAgentSystemNotification(title: string, body: string) {
   if (typeof window === "undefined" || !("Notification" in window)) return;
@@ -225,7 +223,7 @@ function AgentActivityMessage({ events, running, stopping, stopped, onStop }: { 
             const isLatest = index === summary.events.length - 1;
             return <li key={event.event_id || `${event.revision}-${index}`} className="flex items-start gap-2.5 px-3.5 py-2.5 text-xs leading-5 text-slate-600"><span className={cn("mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full", isLatest && summary.isRunning ? "bg-blue-600" : "bg-slate-300")} /><span className="min-w-0 flex-1">{agentActivityEventLabel(event)}{person ? <span className="text-slate-800"> · {person}</span> : null}</span>{event.at ? <time className="shrink-0 text-[10px] tabular-nums text-slate-400">{new Date(event.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time> : null}</li>;
           })}</ol> : null}
-          {waitingForModel ? <div className="border-t border-blue-100 bg-blue-50/70 px-3.5 py-2.5 text-xs text-blue-800" role="status" aria-live="polite">模型正在分析当前文件，已等待 {formatDuration(elapsedSeconds)}；页面保持连接，返回后会自动继续。</div> : null}
+          {waitingForModel ? <div className="border-t border-blue-100 bg-blue-50/70 px-3.5 py-2.5 text-xs text-blue-800" role="status" aria-live="polite">模型正在分析当前文件，已等待 {formatDuration(elapsedSeconds)}；本次请求结束后会停在已保存的状态。</div> : null}
         </div>
       </div>
     </section>
@@ -492,7 +490,7 @@ function ContextPanel({
       <div className="border-b border-slate-200 px-5 py-5">
         <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">公司上下文</p>
         <h2 className="mt-2 truncate text-base font-semibold text-slate-950">{project?.name || "加载中"}</h2>
-        <p className="mt-1 text-xs text-slate-500">所属月 {project?.salary_month || "尚未设置"}</p>
+        <p className="mt-1 text-xs text-slate-500">项目基准月 {project?.salary_month || "尚未设置"}</p>
       </div>
 
       <div className="divide-y divide-slate-100">
@@ -788,6 +786,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   const [activeReviewId, setActiveReviewId] = useState<string | null>(null);
   const [selectedReviewIds, setSelectedReviewIds] = useState<Set<string>>(new Set());
   const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [targetSalaryMonth, setTargetSalaryMonth] = useState("");
   const [pendingPlanInstruction, setPendingPlanInstruction] = useState("");
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
@@ -826,7 +825,6 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
   const composerDockRef = useRef<HTMLDivElement>(null);
   const processRefreshInFlightRef = useRef(false);
   const processRevisionRef = useRef(0);
-  const autoResumeRunRef = useRef<string | null>(null);
   const messageAbortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => {
@@ -855,6 +853,12 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
         setRun(latest);
         try { setItems(await api.listAgentItems(latest.run_id)); } catch { setItems([]); }
       }
+    }
+    if (projectResult.status === "fulfilled") {
+      setTargetSalaryMonth(defaultTargetSalaryMonth(
+        projectResult.value.salary_month,
+        runsResult.status === "fulfilled" ? runsResult.value.items : [],
+      ));
     }
     setLoading(false);
   }, [projectId]);
@@ -981,33 +985,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     };
   }, [projectId, run?.run_id, run?.status]);
 
-  useEffect(() => {
-    const namedShowcase = project?.name === "北京" || project?.name === "样本一" || project?.name === "样本二" || project?.name === "样本四";
-    const shouldResume = isResumableAgentRun(run) || (namedShowcase && run?.status === "processing");
-    if (!run?.run_id || !shouldResume || autoResumeRunRef.current === run.run_id) return;
-    autoResumeRunRef.current = run.run_id;
-    let disposed = false;
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        setProcessRunning(true);
-        try {
-          const resumed = normaliseRun(await api.processAgentRun(run.run_id), projectId);
-          if (disposed) return;
-          if (resumed) setRun(resumed);
-          await refreshProcessEvents(run.run_id);
-          setItems(await api.listAgentItems(run.run_id));
-          toast.info("Agent 正在从已保存的进度自动继续处理");
-        } catch (error) {
-          if (!disposed) toast.error(error instanceof Error ? error.message : "自动续跑启动失败");
-        } finally {
-          if (!disposed) setProcessRunning(false);
-        }
-      })();
-    }, 350);
-    return () => { disposed = true; window.clearTimeout(timer); };
-  }, [project?.name, projectId, refreshProcessEvents, run]);
-
-  // 处理从“进行中”转入“需要用户继续”且自动续跑未接管时，弹窗提醒。
+  // 处理从“进行中”转入“需要用户继续”时，只提醒，不主动调用续跑接口。
   useEffect(() => {
     const previous = prevRunStatusRef.current;
     prevRunStatusRef.current = run?.status ?? null;
@@ -1023,13 +1001,19 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     if (resumePromptTimerRef.current) window.clearTimeout(resumePromptTimerRef.current);
     resumePromptTimerRef.current = window.setTimeout(() => {
       resumePromptTimerRef.current = null;
-      // 延迟期间自动续跑已接管（状态回到活跃）则不弹。
+      // 延迟期间状态已由其他显式操作推进则不弹。
       if (latestRunIdRef.current !== runId || !RESUME_PROMPT_STATUSES.has(latestRunStatusRef.current || "")) return;
       setResumePrompt({ runId, status, detail: String(detail || "") });
       sendAgentSystemNotification("外服账单系统", "Agent 已暂停，需要你发送“继续”才会接着处理。");
     }, RESUME_PROMPT_DELAY_MS);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run?.run_id, run?.status, run?.updated_at]);
+
+  useEffect(() => {
+    if (!run || !["completed", "published"].includes(run.status)) return;
+    if (!["structurally_valid", "passed", "reference_match", "demo_reference_match"].includes(String(run.validation?.status || ""))) return;
+    setTargetSalaryMonth(defaultTargetSalaryMonth(project?.salary_month, [run, ...runs.filter((item) => item.run_id !== run.run_id)]));
+  }, [project?.salary_month, run, runs]);
 
   useEffect(() => () => {
     if (resumePromptTimerRef.current) window.clearTimeout(resumePromptTimerRef.current);
@@ -1160,9 +1144,17 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     setProcessEvents([]);
     setProcessRevision(0);
     try {
-      const started = normaliseRun(await api.startAgentRun(projectId, instruction, false, isShowcaseProject), projectId);
+      const started = normaliseRun(await api.startAgentRun(
+        projectId, instruction, false, isShowcaseProject,
+        isShowcaseProject ? undefined : targetSalaryMonth || undefined,
+      ), projectId);
       if (!started) throw new Error("服务未返回有效的处理批次");
       setRun(started);
+      setRuns((current) => [started, ...current.filter((item) => item.run_id !== started.run_id)]);
+      if (started.status === "blocked") {
+        toast.error(started.detail || "新批次未能创建");
+        return;
+      }
       const processing = normaliseRun(await api.processAgentRun(started.run_id, undefined, true), projectId);
       if (processing) setRun(processing);
       setItems(await api.listAgentItems(started.run_id));
@@ -1170,7 +1162,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       toast.success("Agent 已开始解析文档并处理表格，关闭页面也会继续");
     } catch (error) { toast.error(error instanceof Error ? error.message : "Agent 启动失败"); }
     finally { setProcessRunning(false); setBusy(false); }
-  }, [isShowcaseProject, masterFiles.length, projectId, refreshProcessEvents, sourceFiles.length]);
+  }, [isShowcaseProject, masterFiles.length, projectId, refreshProcessEvents, sourceFiles.length, targetSalaryMonth]);
 
   async function stopRun() {
     if (!run?.run_id || stoppingRun) return;
@@ -1224,7 +1216,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       if (processing) setRun(processing);
       setItems(await api.listAgentItems(run.run_id));
       await refreshProcessEvents(run.run_id);
-      toast.success("处理口径已确认，Agent 正在自动继续");
+      toast.success("处理口径已确认，Agent 正在继续");
       return true;
     } catch (error) {
       if (instruction) setDraft(instruction);
@@ -1461,9 +1453,17 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
       // 理解并与用户对齐颗粒度；执行由“开始处理”按钮或指令显式触发。
       setBusy(true);
       try {
-        const created = normaliseRun(await api.startAgentRun(projectId, content, false, isShowcaseProject), projectId);
+        const created = normaliseRun(await api.startAgentRun(
+          projectId, content, false, isShowcaseProject,
+          isShowcaseProject ? undefined : targetSalaryMonth || undefined,
+        ), projectId);
         if (!created) throw new Error("服务未返回有效的处理批次");
         setRun(created);
+        setRuns((current) => [created, ...current.filter((item) => item.run_id !== created.run_id)]);
+        if (created.status === "blocked") {
+          toast.error(created.detail || "新批次未能创建");
+          return;
+        }
         await streamRunChat(created.run_id, content);
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "任务创建失败");
@@ -1488,13 +1488,30 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     const roundEnded = Boolean((run.workflow?.started_at || run.draft_filename)
       && ["ready", "completed", "published", "failed"].includes(run.status));
     if (roundEnded && !activeItem) {
-      const isNextRoundStart = isAgentStartCommand(content)
-        || (run.status === "failed" && /^(继续|恢复|续跑)$/.test(content.trim()));
-      if (isNextRoundStart) {
-        await executeRun(isAgentStartCommand(content) ? undefined : content);
+      if (isAgentStartCommand(content)) {
+        await startRun();
         return;
       }
-      await streamRunChat(run.run_id, content);
+      setBusy(true);
+      try {
+        const created = normaliseRun(await api.startAgentRun(
+          projectId, content, false, isShowcaseProject,
+          isShowcaseProject ? undefined : targetSalaryMonth || undefined,
+        ), projectId);
+        if (!created) throw new Error("服务未返回有效的处理批次");
+        setRun(created);
+        setRuns((current) => [created, ...current.filter((item) => item.run_id !== created.run_id)]);
+        if (created.status === "blocked") {
+          toast.error(created.detail || "新批次未能创建");
+          return;
+        }
+        await streamRunChat(created.run_id, content);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "新批次创建失败");
+        setDraft(content);
+      } finally {
+        setBusy(false);
+      }
       return;
     }
     // A plan is an internal backend artifact. When an older run still carries
@@ -1767,18 +1784,19 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
     && ["ready", "completed", "published", "failed"].includes(run.status));
   const showStartButton = Boolean(
     (isShowcaseProject || (masterFiles.length && sourceFiles.length))
-      && (!run || inAlignment || (isShowcaseProject && roundEnded)),
+      && (!run || inAlignment || roundEnded),
   );
   const runDetail = streamStatus || (run?.detail && /科园固定案例|不进入模型确认流程/.test(run.detail)
     ? "文件已识别，正在准备本次处理计划"
     : run?.detail);
-  const acceptedRun = Boolean(run?.draft_filename && ["passed", "reference_match", "demo_reference_match"].includes(String(run.validation?.status || "")));
-  const assistantIntro: AgentMessage = { role: "agent", content: run ? `我正在处理「${project?.name || "当前公司"}」${project?.salary_month ? ` ${project.salary_month}` : ""}。${pendingCount ? `目前需要你确认 ${pendingCount} 项。` : processingCount ? "我正在继续核对剩余人员。" : run.status === "ready" || run.status === "published" || run.status === "completed" ? "本轮处理已结束，请查看结果与校验信息。想继续调整或开始下一轮，直接说明新要求，我会复述理解；确认后发送“开始处理”。" : inAlignment ? "执行还没有开始。你可以继续说明本次处理要求，我会复述理解、和你对齐细节；确认后发送“开始处理”或点击下方按钮启动执行。" : "请查看下方当前状态；我会自动续跑，只有影响结果的不确定事项才会向你提问。"}` : "你好，我是这家公司的财务 Agent。上传总表、来源文件和手册后，先告诉我这次的处理要求，我会复述理解、和你对齐颗粒度；你说“开始处理”后我才开始分析和修改。" };
+  const acceptedRun = Boolean(run?.draft_filename && ["structurally_valid", "passed", "reference_match", "demo_reference_match"].includes(String(run.validation?.status || "")));
+  const assistantIntro: AgentMessage = { role: "agent", content: run ? `我正在处理「${project?.name || "当前公司"}」${run.salary_month ? ` ${run.salary_month}` : ""}。${pendingCount ? `目前需要你确认 ${pendingCount} 项。` : processingCount ? "我正在继续核对剩余人员。" : run.status === "ready" || run.status === "published" || run.status === "completed" ? "本轮处理已结束，请查看结果与校验信息。上传新变更文件后，可选择下一个月并创建独立批次。" : inAlignment ? "执行还没有开始。你可以继续说明本次处理要求，我会复述理解、和你对齐细节；确认后发送“开始处理”或点击下方按钮启动执行。" : "请查看下方当前状态；中断后会保留检查点，等待你明确继续。"}` : "你好，我是这家公司的财务 Agent。上传总表、来源文件和手册后，先告诉我这次的处理要求，我会复述理解、和你对齐颗粒度；你说“开始处理”后我才开始分析和修改。" };
   const composer = (
     <div className="w-full max-w-[960px]">
       {files.length || materials.length ? <div className="mb-2"><FileAttachmentList files={files} materials={materials} collapsible onPreview={(file) => void openFilePreview(file)} onRemove={(file) => void removeFile(file)} /></div> : null}
       {uploadFailures.length ? <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-left" role="alert"><p className="text-xs font-medium text-amber-900">部分文件没有接收</p><ul className="mt-1 space-y-0.5 text-[11px] leading-5 text-amber-800">{uploadFailures.map((failure) => <li key={`${failure.filename}-${failure.message}`} className="truncate" title={failure.message}><span className="font-medium">{failure.filename}</span>：{failure.message}</li>)}</ul></div> : null}
-      {showStartButton ? <div className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-left" role="status"><div className="min-w-0"><p className="text-xs font-medium text-blue-950">{run ? "准备开始处理" : "文件已准备好"}</p><p className="mt-0.5 text-[11px] leading-5 text-blue-800">点击后立即执行；未单独选择的待确认事项按 Agent 建议处理，已选择的事项按你的选择执行。</p></div><Button type="button" size="sm" className="h-8 shrink-0 bg-blue-700 px-3 text-xs text-white hover:bg-blue-800" onClick={() => void (run ? executeRun(pendingPlanInstruction || undefined, true) : startRun())} disabled={busy || uploading}><ArrowUp className="mr-1 h-3.5 w-3.5" />开始处理</Button></div> : null}
+      {!isShowcaseProject && (!run || roundEnded) ? <div className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-left"><div className="min-w-0"><label htmlFor="target-salary-month" className="block text-xs font-medium text-slate-800">新批次目标月份</label><p className="mt-0.5 text-[11px] leading-5 text-slate-500">以上一已验收结果为基线，旧月份保持冻结。</p></div><input id="target-salary-month" type="month" value={targetSalaryMonth} onChange={(event) => setTargetSalaryMonth(event.target.value)} disabled={busy || uploading} className="h-9 w-[142px] shrink-0 rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-800 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 disabled:bg-slate-50" /></div> : null}
+      {showStartButton ? <div className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-left" role="status"><div className="min-w-0"><p className="text-xs font-medium text-blue-950">{roundEnded ? `准备创建 ${targetSalaryMonth || "下月"} 独立批次` : run ? "准备开始处理" : "文件已准备好"}</p><p className="mt-0.5 text-[11px] leading-5 text-blue-800">{roundEnded ? "只使用本次新增或变化的来源文件，上一已验收结果只作为只读基线。" : "点击后立即执行；未单独选择的待确认事项按 Agent 建议处理，已选择的事项按你的选择执行。"}</p></div><Button type="button" size="sm" className="h-8 shrink-0 bg-blue-700 px-3 text-xs text-white hover:bg-blue-800" onClick={() => void (roundEnded ? startRun() : run ? executeRun(pendingPlanInstruction || undefined, true) : startRun())} disabled={busy || uploading || (!isShowcaseProject && !targetSalaryMonth)}><ArrowUp className="mr-1 h-3.5 w-3.5" />{roundEnded ? "新建批次" : "开始处理"}</Button></div> : null}
       {acceptedRun && run ? <div className="mb-2 flex justify-end"><Button type="button" size="sm" className="h-7 bg-blue-700 px-2.5 text-[11px] text-white hover:bg-blue-800" onClick={() => void downloadFormalResult()} disabled={busy}><Download className="mr-1 h-3 w-3" />下载正式稿</Button></div> : null}
       <div className="relative flex items-end gap-2 rounded-[28px] border border-slate-300 bg-white px-3 py-2.5 shadow-[0_6px_24px_rgba(15,23,42,0.07)] transition-shadow focus-within:border-blue-400 focus-within:shadow-[0_8px_28px_rgba(37,99,235,0.13)]">
         <div className="relative shrink-0" ref={uploadMenuRef}>
@@ -1813,7 +1831,7 @@ export function AgentWorkbenchPage({ projectId }: { projectId: string }) {
           <Link href="/projects" className="flex shrink-0 items-center gap-2 text-sm font-semibold tracking-tight text-slate-950 hover:text-blue-700"><AgentMascot className="h-6 w-5" />财务 Agent</Link>
           <span className="text-slate-300">/</span>
           <span className="max-w-[34vw] truncate text-sm text-slate-600">{project?.name || "公司"}</span>
-          <span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] text-slate-600">{project?.salary_month || "未设置月份"}</span>
+          <span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] text-slate-600">{run?.salary_month || targetSalaryMonth || project?.salary_month || "未设置月份"}</span>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           <span className={cn("inline-flex items-center gap-1.5 px-2 text-[11px]", (processRunning || run?.status === "processing") ? "text-blue-700" : "text-slate-400")} role={processRunning || run?.status === "processing" ? "status" : undefined} aria-live={processRunning || run?.status === "processing" ? "polite" : undefined}>

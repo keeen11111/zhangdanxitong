@@ -3,9 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import openpyxl
+from openpyxl.chart import BarChart, Reference
+from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Font
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.table import Table
 import pytest
 
 from core.document_agent.orchestrator import ToolExecutionError
@@ -56,6 +63,26 @@ def _change(**overrides: Any) -> dict[str, Any]:
         "target_sheet": "工资核算", "target_cell": "J2", "expected_value": 0,
         "aggregation": "copy", **overrides,
     }
+
+
+def _set_formula_cache(path: Path, coordinate: str, value: int | float) -> None:
+    """Inject one numeric cached result into the first worksheet fixture."""
+    with ZipFile(path, "r") as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    worksheet_name = "xl/worksheets/sheet1.xml"
+    root = ElementTree.fromstring(members[worksheet_name])
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    cell = next(node for node in root.iter(f"{namespace}c") if node.get("r") == coordinate)
+    cached = cell.find(f"{namespace}v")
+    if cached is None:
+        cached = ElementTree.SubElement(cell, f"{namespace}v")
+    cached.text = str(value)
+    members[worksheet_name] = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    temporary = path.with_name(f"{path.stem}.cached.xlsx")
+    with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    temporary.replace(path)
 
 
 def test_prepare_copy_creates_independent_draft_without_touching_inputs(workbooks: SimpleNamespace) -> None:
@@ -159,7 +186,8 @@ def test_batch_failure_never_persists_an_earlier_valid_change(
 def test_insert_and_copy_row_preserves_style_and_translates_formulas(workbooks: SimpleNamespace) -> None:
     workbook = openpyxl.load_workbook(workbooks.master)
     try:
-        sheet = workbook["工资核算"]
+        workbook.remove(workbook["工资核算"])
+        sheet = workbook.create_sheet("工资核算", 0)
         sheet["A2"] = "2026年6月"
         sheet["B2"] = 100
         sheet["C2"] = "=B2*2"
@@ -193,6 +221,300 @@ def test_insert_and_copy_row_preserves_style_and_translates_formulas(workbooks: 
         assert sheet["B3"].font.color.rgb == "0000FF00"
     finally:
         workbook.close()
+    assert {path: path.read_bytes() for path in workbooks.originals} == workbooks.originals
+
+
+def test_insert_and_copy_row_updates_moved_and_summary_formula_references(
+    workbooks: SimpleNamespace,
+) -> None:
+    workbook = openpyxl.load_workbook(workbooks.master)
+    try:
+        workbook.remove(workbook["工资核算"])
+        sheet = workbook.create_sheet("工资核算", 0)
+        sheet["A2"] = "模板人员"
+        sheet["B2"] = 10
+        sheet["C2"] = "=B2*2"
+        sheet["A3"] = "原有人员"
+        sheet["B3"] = 20
+        sheet["C3"] = "=B3*2"
+        sheet["D1"] = "=SUM(B1:B2)"
+        summary = workbook.create_sheet("汇总")
+        summary["A1"] = "=SUM('工资核算'!$B$2:$B$3)"
+        workbook.save(workbooks.master)
+    finally:
+        workbook.close()
+    workbooks.originals[workbooks.master] = workbooks.master.read_bytes()
+    session = _session(workbooks)
+    session.prepare_copy()
+
+    session.insert_and_copy_row({
+        "sheet": "工资核算",
+        "source_row": 2,
+        "insert_before_row": 3,
+        "expected_source_cells": {"A2": "模板人员", "C2": "=B2*2"},
+        "copy_max_column": 3,
+    })
+
+    workbook = openpyxl.load_workbook(workbooks.draft, data_only=False)
+    try:
+        sheet = workbook["工资核算"]
+        assert sheet["C3"].value == "=B3*2"
+        assert sheet["C4"].value == "=B4*2"
+        assert sheet["D1"].value == "=SUM(B1:B2)"
+        assert workbook["汇总"]["A1"].value == "=SUM('工资核算'!$B$2:$B$4)"
+    finally:
+        workbook.close()
+
+
+def test_insert_and_copy_row_repairs_template_objects(
+    workbooks: SimpleNamespace,
+) -> None:
+    workbook = openpyxl.load_workbook(workbooks.master)
+    try:
+        workbook.remove(workbook["工资核算"])
+        sheet = workbook.create_sheet("工资核算", 0)
+        sheet.append(["月份", "金额", "倍数"])
+        sheet.append(["6月", 100, "=B2*2"])
+        sheet.append(["8月", 300, "=B3*2"])
+        sheet.append(["合计", "=SUM(B2:B3)", "=SUM(C2:C3)"])
+        sheet.add_table(Table(displayName="MonthlyTable", ref="A1:C4"))
+        sheet.auto_filter.ref = "A1:C4"
+        validation = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0")
+        validation.add("B2:B3")
+        sheet.add_data_validation(validation)
+        sheet.conditional_formatting.add(
+            "B2:B3", CellIsRule(operator="greaterThan", formula=["0"]),
+        )
+        workbook.defined_names.add(DefinedName(
+            "MonthlyRows", attr_text="'工资核算'!$A$2:$C$3",
+        ))
+        chart = BarChart()
+        chart.add_data(Reference(sheet, min_col=2, min_row=1, max_row=3), titles_from_data=True)
+        chart.set_categories(Reference(sheet, min_col=1, min_row=2, max_row=3))
+        sheet.add_chart(chart, "E2")
+        workbook.save(workbooks.master)
+    finally:
+        workbook.close()
+    workbooks.originals[workbooks.master] = workbooks.master.read_bytes()
+    session = _session(workbooks)
+    session.prepare_copy()
+
+    session.insert_and_copy_row({
+        "sheet": "工资核算",
+        "source_row": 2,
+        "insert_before_row": 3,
+        "expected_source_cells": {"A2": "6月", "C2": "=B2*2"},
+        "copy_max_column": 3,
+    })
+
+    updated = openpyxl.load_workbook(workbooks.draft, data_only=False)
+    try:
+        sheet = updated["工资核算"]
+        assert sheet.tables["MonthlyTable"].ref == "A1:C5"
+        assert sheet.auto_filter.ref == "A1:C5"
+        assert str(sheet.data_validations.dataValidation[0].sqref) == "B2:B4"
+        assert [str(item.sqref) for item in sheet.conditional_formatting] == ["B2:B4"]
+        assert updated.defined_names["MonthlyRows"].attr_text == "'工资核算'!$A$2:$C$4"
+        series = sheet._charts[0].series[0]
+        assert series.val.numRef.f == "'工资核算'!$B$2:$B$4"
+        assert series.cat.numRef.f == "'工资核算'!$A$2:$A$4"
+    finally:
+        updated.close()
+    assert {path: path.read_bytes() for path in workbooks.originals} == workbooks.originals
+
+
+def test_formula_row_repair_preserves_digit_suffixed_function_names() -> None:
+    inserted = WorkbookSession._shift_formula_references_for_row_insert(
+        '=LOG10(B3)+"LOG10(B3)"',
+        current_sheet="工资核算",
+        target_sheet="工资核算",
+        insert_before_row=3,
+    )
+    deleted = WorkbookSession._shift_formula_references_for_row_delete(
+        "=LOG10(B3)",
+        current_sheet="工资核算",
+        target_sheet="工资核算",
+        deleted_rows=[2],
+    )
+
+    assert inserted == '=LOG10(B4)+"LOG10(B3)"'
+    assert deleted == "=LOG10(B2)"
+
+
+def test_formula_row_repair_handles_a_direct_quoted_cross_sheet_reference() -> None:
+    inserted = WorkbookSession._shift_formula_references_for_row_insert(
+        "='明细'!AO6",
+        current_sheet="付款通知书",
+        target_sheet="明细",
+        insert_before_row=4,
+    )
+    deleted = WorkbookSession._shift_formula_references_for_row_delete(
+        "='明细'!AO6",
+        current_sheet="付款通知书",
+        target_sheet="明细",
+        deleted_rows=[4],
+    )
+
+    assert inserted == "='明细'!AO7"
+    assert deleted == "='明细'!AO5"
+
+
+def test_personnel_row_insert_writes_identity_and_clears_template_business_values(
+    workbooks: SimpleNamespace,
+) -> None:
+    workbook = openpyxl.load_workbook(workbooks.master)
+    try:
+        workbook.remove(workbook["工资核算"])
+        sheet = workbook.create_sheet("工资核算", 0)
+        sheet.append(["工号", "姓名", "基本工资", "应发工资"])
+        sheet.append(["E001", "模板人员", 5000, "=C2"])
+        sheet.append(["*合计*", None, "=SUM(C2:C2)", "=SUM(D2:D2)"])
+        workbook.save(workbooks.master)
+    finally:
+        workbook.close()
+    workbooks.originals[workbooks.master] = workbooks.master.read_bytes()
+    session = _session(workbooks)
+    session.prepare_copy()
+
+    update = session.insert_and_copy_row({
+        "sheet": "工资核算", "source_row": 2, "insert_before_row": 3,
+        "expected_source_cells": {"A2": "E001", "B2": "模板人员"},
+        "copy_max_column": 4,
+        "identity_values": {"A3": "E002", "B3": "李楠"},
+    })
+
+    assert update["identity_validated"] is True
+    assert update["identity_cells"] == {"A3": "E002", "B3": "李楠"}
+    draft = openpyxl.load_workbook(workbooks.draft, data_only=False)
+    try:
+        sheet = draft["工资核算"]
+        assert [sheet["A3"].value, sheet["B3"].value] == ["E002", "李楠"]
+        assert sheet["C3"].value is None
+        assert sheet["D3"].value == "=C3"
+        assert sheet["C4"].value == "=SUM(C2:C3)"
+    finally:
+        draft.close()
+    assert {path: path.read_bytes() for path in workbooks.originals} == workbooks.originals
+
+
+def test_personnel_row_insert_without_complete_identity_is_atomic(
+    workbooks: SimpleNamespace,
+) -> None:
+    workbook = openpyxl.load_workbook(workbooks.master)
+    try:
+        workbook.remove(workbook["工资核算"])
+        sheet = workbook.create_sheet("工资核算", 0)
+        sheet.append(["工号", "姓名", "基本工资"])
+        sheet.append(["E001", "模板人员", 5000])
+        workbook.save(workbooks.master)
+    finally:
+        workbook.close()
+    workbooks.originals[workbooks.master] = workbooks.master.read_bytes()
+    session = _session(workbooks)
+    session.prepare_copy()
+    before = workbooks.draft.read_bytes()
+
+    with pytest.raises(ToolExecutionError, match="完整身份字段"):
+        session.insert_and_copy_row({
+            "sheet": "工资核算", "source_row": 2, "insert_before_row": 3,
+            "expected_source_cells": {"A2": "E001", "B2": "模板人员"},
+            "copy_max_column": 3,
+            "identity_values": {"B3": "李楠"},
+        })
+
+    assert workbooks.draft.read_bytes() == before
+    assert {path: path.read_bytes() for path in workbooks.originals} == workbooks.originals
+
+
+def test_delete_rows_repairs_moved_and_cross_sheet_summary_formulas(
+    workbooks: SimpleNamespace,
+) -> None:
+    workbook = openpyxl.load_workbook(workbooks.master)
+    try:
+        workbook.remove(workbook["工资核算"])
+        sheet = workbook.create_sheet("工资核算", 0)
+        sheet.append(["姓名", "基本工资", "应发工资"])
+        sheet.append(["甲", 100, "=B2*2"])
+        sheet.append(["乙", 200, "=B3*2"])
+        sheet.append(["丙", 300, "=B4*2"])
+        sheet.append(["*合计*", "=SUM(B2:B4)", "=SUM(C2:C4)"])
+        summary = workbook.create_sheet("汇总")
+        summary["A1"] = "=SUM('工资核算'!B2:B4)"
+        workbook.save(workbooks.master)
+    finally:
+        workbook.close()
+    workbooks.originals[workbooks.master] = workbooks.master.read_bytes()
+    session = _session(workbooks)
+    session.prepare_copy()
+
+    session.delete_rows({
+        "sheet": "工资核算", "rows": [3], "expected_cells": {"A3": "乙"},
+    })
+
+    draft = openpyxl.load_workbook(workbooks.draft, data_only=False)
+    try:
+        sheet = draft["工资核算"]
+        assert sheet["A3"].value == "丙"
+        assert sheet["C3"].value == "=B3*2"
+        assert sheet["B4"].value == "=SUM(B2:B3)"
+        assert sheet["C4"].value == "=SUM(C2:C3)"
+        assert draft["汇总"]["A1"].value == "=SUM('工资核算'!B2:B3)"
+    finally:
+        draft.close()
+    assert {path: path.read_bytes() for path in workbooks.originals} == workbooks.originals
+
+
+def test_delete_rows_repairs_template_objects(
+    workbooks: SimpleNamespace,
+) -> None:
+    workbook = openpyxl.load_workbook(workbooks.master)
+    try:
+        workbook.remove(workbook["工资核算"])
+        sheet = workbook.create_sheet("工资核算", 0)
+        sheet.append(["姓名", "金额"])
+        sheet.append(["甲", 100])
+        sheet.append(["乙", 200])
+        sheet.append(["丙", 300])
+        sheet.append(["合计", "=SUM(B2:B4)"])
+        sheet.add_table(Table(displayName="PayrollTable", ref="A1:B5"))
+        sheet.auto_filter.ref = "A1:B5"
+        validation = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0")
+        validation.add("B2:B4")
+        sheet.add_data_validation(validation)
+        sheet.conditional_formatting.add(
+            "B2:B4", CellIsRule(operator="greaterThan", formula=["0"]),
+        )
+        workbook.defined_names.add(DefinedName(
+            "PayrollRows", attr_text="'工资核算'!$A$2:$B$4",
+        ))
+        chart = BarChart()
+        chart.add_data(Reference(sheet, min_col=2, min_row=1, max_row=4), titles_from_data=True)
+        chart.set_categories(Reference(sheet, min_col=1, min_row=2, max_row=4))
+        sheet.add_chart(chart, "D2")
+        workbook.save(workbooks.master)
+    finally:
+        workbook.close()
+    workbooks.originals[workbooks.master] = workbooks.master.read_bytes()
+    session = _session(workbooks)
+    session.prepare_copy()
+
+    session.delete_rows({
+        "sheet": "工资核算", "rows": [3], "expected_cells": {"A3": "乙"},
+    })
+
+    updated = openpyxl.load_workbook(workbooks.draft, data_only=False)
+    try:
+        sheet = updated["工资核算"]
+        assert sheet.tables["PayrollTable"].ref == "A1:B4"
+        assert sheet.auto_filter.ref == "A1:B4"
+        assert str(sheet.data_validations.dataValidation[0].sqref) == "B2:B3"
+        assert [str(item.sqref) for item in sheet.conditional_formatting] == ["B2:B3"]
+        assert updated.defined_names["PayrollRows"].attr_text == "'工资核算'!$A$2:$B$3"
+        series = sheet._charts[0].series[0]
+        assert series.val.numRef.f == "'工资核算'!$B$2:$B$3"
+        assert series.cat.numRef.f == "'工资核算'!$A$2:$A$3"
+    finally:
+        updated.close()
     assert {path: path.read_bytes() for path in workbooks.originals} == workbooks.originals
 
 
@@ -281,39 +603,91 @@ def test_roll_forward_summary_row_keeps_current_formulas_and_freezes_history(wor
         sheet["A2"] = "6月"
         sheet["B2"] = 40
         sheet["C2"] = "=B2*2"
+        sheet["E4"] = "=C2"
         workbook.save(workbooks.master)
     finally:
         workbook.close()
+    _set_formula_cache(workbooks.master, "C2", 80)
     workbooks.originals[workbooks.master] = workbooks.master.read_bytes()
     session = _session(workbooks)
     session.prepare_copy()
 
     update = session.roll_forward_summary_row({
-        "sheet": "工资核算", "current_row": 2, "expected_current_month": "6月", "new_month": "8月",
+        "sheet": "工资核算", "current_row": 2, "expected_current_month": "6月", "new_month": "7月",
         "start_column": 1, "end_column": 3,
-        "history_values": {"A2": "6月", "B2": 40, "C2": 80},
     })
 
-    assert update == {"sheet": "工资核算", "current_row": 2, "history_row": 3, "new_month": "8月"}
+    assert update["sheet"] == "工资核算"
+    assert update["current_row"] == 2
+    assert update["history_row"] == 3
+    assert update["new_month"] == "7月"
+    assert update["history_values"] == {"A3": "6月", "B3": 40, "C3": 80}
+    assert update["history_snapshot"] == {
+        "A3": "6月", "B3": 40, "C3": 80,
+        "A4": None, "B4": None, "C4": None,
+        "A5": None, "B5": None, "C5": None,
+    }
     workbook = openpyxl.load_workbook(workbooks.draft, data_only=False)
     try:
         sheet = workbook["工资核算"]
-        assert [sheet.cell(2, column).value for column in range(1, 4)] == ["8月", 40, "=B2*2"]
+        assert [sheet.cell(2, column).value for column in range(1, 4)] == ["7月", 40, "=B2*2"]
         assert [sheet.cell(3, column).value for column in range(1, 4)] == ["6月", 40, 80]
+        assert sheet["E5"].value == "=C3"
     finally:
         workbook.close()
+    assert {path: path.read_bytes() for path in workbooks.originals} == workbooks.originals
 
 
 def test_roll_forward_summary_row_rejects_missing_history_values_atomically(workbooks: SimpleNamespace) -> None:
+    workbook = openpyxl.load_workbook(workbooks.master)
+    try:
+        sheet = workbook["工资核算"]
+        sheet["A2"] = "6月"
+        sheet["C2"] = "=B2*2"
+        workbook.save(workbooks.master)
+    finally:
+        workbook.close()
     session = _session(workbooks)
     session.prepare_copy()
     draft_before = workbooks.draft.read_bytes()
 
-    with pytest.raises(ToolExecutionError):
+    with pytest.raises(ToolExecutionError, match="缓存"):
         session.roll_forward_summary_row({
-            "sheet": "工资核算", "current_row": 2, "expected_current_month": None, "new_month": "8月",
+            "sheet": "工资核算", "current_row": 2, "expected_current_month": "6月", "new_month": "7月",
             "start_column": 1, "end_column": 3,
-            "history_values": {"A2": None},
         })
 
     assert workbooks.draft.read_bytes() == draft_before
+
+
+def test_roll_forward_closes_formula_view_when_cached_view_cannot_open(
+    workbooks: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session(workbooks)
+    session.prepare_copy()
+    real_load_workbook = openpyxl.load_workbook
+    formula_workbook = real_load_workbook(workbooks.draft, data_only=False)
+    closed: list[bool] = []
+    real_close = formula_workbook.close
+
+    def tracked_close() -> None:
+        closed.append(True)
+        real_close()
+
+    formula_workbook.close = tracked_close
+
+    def fail_cached_view(_path: Path, *, data_only: bool):
+        if data_only:
+            raise OSError("cached view unavailable")
+        return formula_workbook
+
+    monkeypatch.setattr("core.document_agent.workbook_session.openpyxl.load_workbook", fail_cached_view)
+
+    with pytest.raises(ToolExecutionError, match="无法读取"):
+        session.roll_forward_summary_row({
+            "sheet": "工资核算", "current_row": 2,
+            "expected_current_month": None, "new_month": "7月",
+            "start_column": 1, "end_column": 3,
+        })
+
+    assert closed == [True]

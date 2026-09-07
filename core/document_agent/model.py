@@ -13,6 +13,9 @@ import http.client
 import time
 import urllib.error
 import urllib.request
+import re
+import math
+from uuid import uuid4
 from typing import Any, Iterator, Literal, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -20,8 +23,72 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from .contracts import ToolCall
 
 
+def estimate_token_count(value: Any) -> int:
+    """Conservative provider-independent token estimate for budget decisions.
+
+    A tokenizer is not guaranteed to be installed for every compatible model.
+    ASCII prose/JSON is estimated at roughly four characters per token, while
+    non-ASCII text is counted one character per token.  The latter is
+    intentionally conservative for Chinese payroll data, where a four-char
+    estimate materially undercounts the provider token budget.
+    """
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    ascii_count = sum(character.isascii() for character in text)
+    non_ascii_count = len(text) - ascii_count
+    return max(0, math.ceil(ascii_count / 4 + non_ascii_count))
+
+
+def _deduplicate_provider_tools(
+    tools: Sequence[Mapping[str, Any]] | None,
+) -> tuple[list[Mapping[str, Any]], list[str]]:
+    """Normalize the final provider contract to one definition per name.
+
+    Different execution entry points can compose overlapping read, write and
+    validation contracts.  OpenAI-compatible providers reject duplicate
+    function names with HTTP 400 before model execution, so this boundary is
+    the last place where the invariant can be guaranteed for every caller.
+    The first definition remains authoritative; the names removed are exposed
+    in request metadata for diagnostics without sending duplicate schemas.
+    """
+    unique: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, Mapping) else None
+        name = function.get("name") if isinstance(function, Mapping) else None
+        if isinstance(name, str) and name:
+            if name in seen:
+                if name not in duplicates:
+                    duplicates.append(name)
+                continue
+            seen.add(name)
+        unique.append(tool)
+    return unique, duplicates
+
+
 class ModelProviderError(RuntimeError):
-    """Safe, user-facing provider failure without response body or secrets."""
+    """Safe provider failure with bounded, secret-free diagnostics."""
+
+    def __init__(self, message: str, *, status_code: int | None = None,
+                 error_type: str | None = None, error_code: str | None = None,
+                 body_summary: str | None = None, request_meta: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = error_type
+        self.error_code = error_code
+        self.body_summary = body_summary or ""
+        self.request_meta = dict(request_meta or {})
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "status_code": self.status_code,
+            "error_type": self.error_type,
+            "error_code": self.error_code,
+            "body_summary": self.body_summary,
+            **{key: value for key, value in self.request_meta.items()
+               if key in {"input_chars", "estimated_input_tokens", "tool_schema_chars",
+                          "estimated_tool_tokens", "max_output_tokens", "stage", "provider", "model"}},
+        }
 
 
 # 单次模型请求的硬性超时上限：超过该值的配置会被压缩，
@@ -179,6 +246,7 @@ class ModelResponse(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     finish_reason: str | None = None
     request_id: str | None = None
+    provider_request_id: str | None = None
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
 
@@ -190,6 +258,27 @@ class OpenAICompatibleProvider:
         if config.provider != "openai_compatible":
             raise ValueError("unsupported model provider")
         self.config = config
+        self.last_request_meta: dict[str, Any] = {}
+        self._pending_request_id: str | None = None
+
+    def set_request_id(self, request_id: str) -> None:
+        """Attach the orchestrator's local correlation ID to the next call."""
+        self._pending_request_id = request_id
+
+    def _request_metadata(self, messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]] | None,
+                          *, stage: str | None = None) -> dict[str, Any]:
+        input_chars = len(json.dumps(list(messages), ensure_ascii=False, default=str))
+        tool_schema_chars = len(json.dumps(list(tools or []), ensure_ascii=False, default=str))
+        return {
+            "input_chars": input_chars,
+            "estimated_input_tokens": estimate_token_count(json.dumps(list(messages), ensure_ascii=False, default=str)),
+            "tool_schema_chars": tool_schema_chars,
+            "estimated_tool_tokens": estimate_token_count(json.dumps(list(tools or []), ensure_ascii=False, default=str)),
+            "max_output_tokens": self.config.max_output_tokens,
+            "provider": self.config.provider,
+            "model": self.config.model,
+            "stage": stage or "model_call",
+        }
 
     @staticmethod
     def _decode_tool_arguments(value: Any) -> dict[str, Any]:
@@ -228,8 +317,19 @@ class OpenAICompatibleProvider:
         tools: Sequence[Mapping[str, Any]] | None = None,
         temperature: float = 0.0,
     ) -> ModelResponse:
+        local_request_id = self._pending_request_id or uuid4().hex
+        self._pending_request_id = None
+        normalized_tools, duplicate_tool_names = _deduplicate_provider_tools(tools)
+        self.last_request_meta = self._request_metadata(messages, normalized_tools)
+        if duplicate_tool_names:
+            self.last_request_meta["deduplicated_tool_names"] = duplicate_tool_names
+        self.last_request_meta["request_id"] = local_request_id
         if self.config.api_style == "responses":
-            return self._complete_responses(messages=messages, tools=tools)
+            response = self._complete_responses(messages=messages, tools=normalized_tools)
+            response.provider_request_id = response.request_id
+            response.request_id = local_request_id
+            self.last_request_meta["provider_request_id"] = response.provider_request_id
+            return response
         base = self.config.base_url.rstrip("/")
         url = f"{base}/chat/completions"
         payload: dict[str, Any] = {
@@ -238,8 +338,8 @@ class OpenAICompatibleProvider:
             "temperature": temperature,
             "max_tokens": self.config.max_output_tokens,
         }
-        if tools:
-            payload["tools"] = list(tools)
+        if normalized_tools:
+            payload["tools"] = list(normalized_tools)
             payload["tool_choice"] = "auto"
         if not self.config.enable_thinking and "api.deepseek.com" in self.config.base_url:
             # deepseek-v4 系列是默认开启思考的混合推理模型，且思考 token 计入
@@ -270,12 +370,44 @@ class OpenAICompatibleProvider:
                 raw = response.read()
             decoded = json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise ModelProviderError(_http_error_message(exc.code)) from exc
+            raise self._provider_http_error(exc) from exc
         except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             raise ModelProviderError("模型服务暂时不可用") from exc
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ModelProviderError("模型响应不是有效 JSON") from exc
-        return self._parse_response(decoded)
+        response = self._parse_response(decoded)
+        response.provider_request_id = response.request_id
+        response.request_id = local_request_id
+        self.last_request_meta["provider_request_id"] = response.provider_request_id
+        return response
+
+    def _provider_http_error(self, exc: urllib.error.HTTPError) -> ModelProviderError:
+        """Extract only bounded diagnostic fields from an HTTP error body."""
+        raw = b""
+        try:
+            raw = exc.read(8192)
+        except Exception:
+            pass
+        error_type = error_code = None
+        summary = ""
+        try:
+            decoded = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            detail = decoded.get("error") if isinstance(decoded, dict) else None
+            if isinstance(detail, dict):
+                error_type = str(detail.get("type") or "")[:128] or None
+                error_code = str(detail.get("code") or "")[:128] or None
+                summary = str(detail.get("message") or "")
+            elif isinstance(detail, str):
+                summary = detail
+        except Exception:
+            summary = raw.decode("utf-8", errors="replace")[:500]
+        summary = re.sub(r"(?:Bearer\s+|api[_-]?key\s*[=:]\s*)[^\s,;]+", "[redacted]", summary, flags=re.I)
+        summary = re.sub(r"[A-Za-z0-9+/=_-]{24,}", "[redacted]", summary)[:500]
+        return ModelProviderError(
+            _http_error_message(exc.code), status_code=exc.code,
+            error_type=error_type, error_code=error_code,
+            body_summary=summary, request_meta=self.last_request_meta,
+        )
 
     def stream_text(
         self,
@@ -375,7 +507,7 @@ class OpenAICompatibleProvider:
         except ModelProviderError:
             raise
         except urllib.error.HTTPError as exc:
-            raise ModelProviderError(_http_error_message(exc.code)) from exc
+            raise self._provider_http_error(exc) from exc
         except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             raise ModelProviderError("模型服务暂时不可用") from exc
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -402,7 +534,7 @@ class OpenAICompatibleProvider:
                 raw = response.read()
             return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise ModelProviderError(_http_error_message(exc.code)) from exc
+            raise self._provider_http_error(exc) from exc
         except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
             raise ModelProviderError("模型服务暂时不可用") from exc
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:

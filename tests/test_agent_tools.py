@@ -59,6 +59,65 @@ def test_run_registry_never_applies_an_ambiguous_item(tmp_path: Path) -> None:
     workbook.close()
 
 
+def test_run_registry_records_atomic_single_cell_write(tmp_path: Path) -> None:
+    path = tmp_path / "draft.xlsx"
+    _workbook(path)
+    run = {
+        "run_id": "run-atomic", "project_id": "project-1", "salary_month": "2026.07",
+        "draft_filename": path.name,
+        "items": [{
+            "id": "item-1", "person_key": "E001", "person_name": "李某",
+            "status": "needs_review", "issue_type": "agent_review",
+            "target_sheet": "工资核算", "target_cell": "J2", "current_value": 2000,
+            "candidate_values": [3000],
+        }],
+        "workbook_updates": [],
+    }
+    registry = _build_run_tool_registry(run, workbook_path=path)
+
+    result = registry.execute(ToolCall(
+        call_id="call-atomic", name="apply_cell_changes",
+        arguments={"item_id": "item-1", "value": 3000},
+    ))
+
+    assert result.ok is True
+    assert result.output["before"] == 2000
+    assert result.output["after"] == 3000
+    assert run["workbook_updates"][0]["target_cell"] == "J2"
+    workbook = openpyxl.load_workbook(path, data_only=False)
+    assert workbook["工资核算"]["J2"].value == 3000
+    workbook.close()
+
+
+def test_validate_workbook_rejects_formula_errors_and_duplicate_identities(tmp_path: Path) -> None:
+    path = tmp_path / "draft.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "明细"
+    sheet.append(["工号", "姓名", "金额"])
+    sheet.append(["E001", "张三", 100])
+    sheet.append(["E001", "张三", "#REF!"])
+    sheet.append([None, "李楠", 200])
+    workbook.save(path)
+    workbook.close()
+    registry = _build_run_tool_registry({
+        "run_id": "run-validation", "project_id": "project-1", "draft_filename": path.name,
+        "items": [],
+    }, workbook_path=path)
+
+    result = registry.execute(ToolCall(
+        call_id="call-validation", name="validate_workbook", arguments={},
+    ))
+
+    assert result.ok is True
+    assert result.output["can_publish"] is False
+    assert result.output["formula_errors"]
+    assert result.output["duplicate_identities"]
+    assert result.output["identity_errors"] == [{
+        "sheet": "明细", "row": 4, "error": "missing_name_or_employee_id",
+    }]
+
+
 def test_run_registry_selects_only_a_candidate_sheet_and_calls_reintegration(tmp_path: Path) -> None:
     path = tmp_path / "draft.xlsx"
     _workbook(path)

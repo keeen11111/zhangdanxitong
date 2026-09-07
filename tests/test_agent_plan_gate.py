@@ -449,14 +449,36 @@ def test_agent_main_flow_uses_model_tools_to_write_only_draft_and_cannot_self_ap
                         "target_sheet": "工资核算", "target_cell": "C2", "expected_value": 0, "aggregation": "copy",
                     }],
                 })])
+            if len(snapshots) == 3:
+                return ModelResponse(tool_calls=[
+                    ToolCall(call_id="validate-structure", name="validate_workbook"),
+                    ToolCall(call_id="validate-recalc", name="validate_with_officecli"),
+                ])
             return ModelResponse(content="已将E001奖金2000写入草稿，仍需验收。")
 
     monkeypatch.setattr("backend.agent_execution.OpenAICompatibleProvider", ExecutionProvider)
+    monkeypatch.setattr(agent.shutil, "which", lambda _name: "officecli")
+
+    class OfficeValidation:
+        returncode = 0
+        stdout = "valid"
+        stderr = ""
+
+    def officecli_run(command, **_kwargs):
+        if "query" in command:
+            return type("FormulaValidation", (), {
+                "returncode": 0,
+                "stdout": json.dumps({"success": True, "data": {"matches": 0, "results": []}}),
+                "stderr": "",
+            })()
+        return OfficeValidation()
+
+    monkeypatch.setattr(agent.subprocess, "run", officecli_run)
 
     result = agent._execute_agent_run_sync(run_id, scenario.user, scenario.db)
 
     assert scenario.calls == []
-    assert len(snapshots) == 3
+    assert len(snapshots) == 4
     advertised = {schema["function"]["name"] for schema in snapshots[0]["tools"]}
     assert {
         "prepare_workbook_copy",
@@ -470,8 +492,12 @@ def test_agent_main_flow_uses_model_tools_to_write_only_draft_and_cannot_self_ap
         message["tool_call_id"]: json.loads(message["content"])
         for message in snapshots[1]["messages"] if message["role"] == "tool"
     }
-    assert read_results["target"]["values"] == [["E001", "测试人员", 0]]
-    assert read_results["source"]["values"] == [["E001", "测试人员", 2000]]
+    assert read_results["target"]["checkpoint_id"]
+    assert read_results["source"]["checkpoint_id"]
+    assert [cell["value"] for cell in read_results["target"]["current_cells"]] == ["E001", "测试人员", 0]
+    assert [cell["value"] for cell in read_results["source"]["current_cells"]] == ["E001", "测试人员", 2000]
+    assert "values" not in read_results["target"]
+    assert "values" not in read_results["source"]
     draft = agent._result_path("project-1", result["draft_filename"])
     assert draft not in scenario.originals
     workbook = openpyxl.load_workbook(draft, data_only=False)
@@ -488,6 +514,7 @@ def test_agent_main_flow_uses_model_tools_to_write_only_draft_and_cannot_self_ap
     assert [(item["name"], item["status"]) for item in tool_results] == [
         ("prepare_workbook_copy", "succeeded"), ("read_range", "succeeded"),
         ("read_source_range", "succeeded"), ("apply_source_cells", "succeeded"),
+        ("validate_workbook", "succeeded"), ("validate_with_officecli", "succeeded"),
     ]
     assert result["validation"]["status"] == "not_verified"
     saved = agent._load_run(run_id, scenario.user)
@@ -819,6 +846,42 @@ def test_model_execution_context_includes_project_skill_policy(
     assert "先概览再读必要范围" in skill_context["execution_policy"]
     routes = {route["id"]: route for route in skill_context["task_routing"]}
     assert routes["workbook-update"]["runtime_mode"] == "registered_tools_only"
+
+
+def test_writing_context_contains_only_current_batch_state() -> None:
+    from backend.agent_execution import _execution_context
+
+    run = {
+        "instruction": "含敏感原始说明",
+        "model_plan": {"summary": "完整计划", "steps": ["读取所有来源", "写入全部数据"]},
+        "conversation": [{"role": "user", "content": "长篇历史对话"}],
+        "workbook_updates": [{"target_sheet": "明细", "target_cell": "Q30", "new_value": 456}],
+        "sheet_mappings": [{"source_file": "source.xlsx", "source_sheet": "派遣", "target_sheet": "明细"}],
+        "execution_checkpoint": {
+            "pending_writes": [{
+                "source_file": "source.xlsx", "source_sheet": "派遣", "source_cells": ["J30"],
+                "target_sheet": "明细", "target_cell": "Q30", "expected_value": 123,
+            }],
+            "last_read_checkpoint": "cp-1",
+        },
+        "draft_filename": "draft.xlsx",
+    }
+
+    context = _execution_context(
+        run,
+        materials=[{"filename": "rules.docx", "excerpt": "完整材料正文"}],
+        rules={"raw": "完整规则包"},
+    )
+
+    serialized = json.dumps(context, ensure_ascii=False)
+    assert set(context) == {"current_batch", "state"}
+    assert context["current_batch"]["stage"] == "writing"
+    assert context["current_batch"]["pending_writes"][0]["target_cell"] == "Q30"
+    assert context["state"]["last_read_checkpoint"] == "cp-1"
+    assert "长篇历史对话" not in serialized
+    assert "完整材料正文" not in serialized
+    assert "完整计划" not in serialized
+    assert "完整规则包" not in serialized
 
 
 def test_public_run_recovers_legacy_empty_execution_as_resumable() -> None:

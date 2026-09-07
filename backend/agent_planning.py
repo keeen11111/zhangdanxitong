@@ -98,14 +98,10 @@ def build_model_plan(
             for name, path in run["_source_paths"].items()
         ],
         "materials": materials, "rule_packages": rules,
-        # The pre-execution alignment dialogue is binding context: the plan
-        # must reflect what the user and assistant actually agreed on.
-        "conversation": [
-            {"role": ("assistant" if str(message.get("role")) == "agent" else "user"),
-             "content": str(message.get("content") or "")[:2000]}
-            for message in (run.get("conversation") or [])[-12:]
-            if isinstance(message, dict)
-        ],
+        # Alignment is already folded into the confirmed instruction/plan by
+        # the route layer. Planner input is intentionally metadata-only: long
+        # natural-language history belongs in the durable machine state, not in
+        # every planning request.
     }
     # A full manual plan needs more output than a single-cell tool decision,
     # but an oversized output budget makes the planning phase slow and expensive.

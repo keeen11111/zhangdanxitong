@@ -99,6 +99,8 @@ export interface AgentRun {
   company_id?: string | null;
   company_name?: string | null;
   salary_month?: string | null;
+  target_salary_month?: string | null;
+  month_authority?: string | null;
   rule_version?: string | null;
   status: AgentRunStatus;
   code?: string | null;
@@ -747,10 +749,22 @@ export const api = {
     }),
 
   // ---------- Agent（文档驱动 Excel 处理） ----------
-  startAgentRun: (projectId: string, instruction = "按公司生效规则更新总表", autoPublish = false, demo = false) =>
+  startAgentRun: (
+    projectId: string,
+    instruction = "按公司生效规则更新总表",
+    autoPublish = false,
+    demo = false,
+    targetSalaryMonth?: string,
+  ) =>
     request<Record<string, unknown>>("/api/agent/runs", {
       method: "POST",
-      body: JSON.stringify({ project_id: projectId, instruction, auto_publish: autoPublish, demo }),
+      body: JSON.stringify({
+        project_id: projectId,
+        instruction,
+        auto_publish: autoPublish,
+        demo,
+        ...(targetSalaryMonth ? { target_salary_month: targetSalaryMonth } : {}),
+      }),
     }, {
       timeoutMs: FINANCIAL_INTEGRATION_TIMEOUT_MS,
       timeoutMessage: "Agent 正在处理文件超过 15 分钟，请刷新页面查看运行状态",

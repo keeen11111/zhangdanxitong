@@ -13,6 +13,32 @@ export type AgentTimelineEvent = {
 
 export type AgentShortcutAction = AgentDecisionAction | "next";
 
+const ACCEPTED_VALIDATION_STATUSES = new Set([
+  "structurally_valid", "passed", "reference_match", "demo_reference_match",
+]);
+
+function normaliseSalaryMonth(value?: string | null) {
+  const match = String(value || "").trim().match(/^(20\d{2})[.-](0[1-9]|1[0-2])$/);
+  return match ? `${match[1]}-${match[2]}` : "";
+}
+
+/** Pick the backend-compatible target for a newly created monthly run. */
+export function defaultTargetSalaryMonth(projectMonth: string | null | undefined, runs: AgentRun[]) {
+  const latestMonth = runs.reduce((latest, run) => {
+    if (!["completed", "published"].includes(run.status)) return latest;
+    if (!ACCEPTED_VALIDATION_STATUSES.has(String(run.validation?.status || ""))) return latest;
+    const month = normaliseSalaryMonth(run.salary_month);
+    return month > latest ? month : latest;
+  }, "");
+  if (latestMonth) {
+    const [year, month] = latestMonth.split("-").map(Number);
+    return month === 12
+      ? `${year + 1}-01`
+      : `${year}-${String(month + 1).padStart(2, "0")}`;
+  }
+  return normaliseSalaryMonth(projectMonth);
+}
+
 /** Resolve the documented review shortcuts without coupling them to the UI. */
 export function agentShortcutAction(key: string, altKey: boolean): AgentShortcutAction | null {
   if (!altKey) return null;

@@ -11,6 +11,8 @@ from typing import Any
 import openpyxl
 from openpyxl.utils import get_column_letter
 
+from core.document_agent.workbook_session import WorkbookSession
+
 
 class RosterSyncError(ValueError):
     """Raised when a roster-scoped update cannot be performed safely."""
@@ -168,6 +170,48 @@ def _set_value(sheet: Any, row: int, column: int, value: Any, changes: list[dict
     })
 
 
+def _set_value_preserving_formula(
+    sheet: Any, row: int, column: int, value: Any, changes: list[dict[str, Any]],
+) -> None:
+    if sheet.cell(row, column).data_type == "f":
+        return
+    _set_value(sheet, row, column, value, changes)
+
+
+def _repair_formulas_after_row_delete(
+    workbook: openpyxl.Workbook,
+    *,
+    target_sheet: str,
+    deleted_rows: list[int],
+    formula_snapshot: list[tuple[str, str, str]],
+    changes: list[dict[str, Any]],
+) -> None:
+    deleted_set = set(deleted_rows)
+    for worksheet_name, coordinate, formula in formula_snapshot:
+        old_row_match = re.search(r"[0-9]+$", coordinate)
+        column_match = re.match(r"[A-Za-z]+", coordinate)
+        if old_row_match is None or column_match is None:
+            continue
+        old_row = int(old_row_match.group(0))
+        if worksheet_name == target_sheet:
+            if old_row in deleted_set:
+                continue
+            new_row = old_row - sum(candidate < old_row for candidate in deleted_rows)
+            new_coordinate = f"{column_match.group(0)}{new_row}"
+        else:
+            new_coordinate = coordinate
+        repaired = WorkbookSession._shift_formula_references_for_row_delete(
+            formula,
+            current_sheet=worksheet_name,
+            target_sheet=target_sheet,
+            deleted_rows=deleted_rows,
+        )
+        target_cell = workbook[worksheet_name][new_coordinate]
+        _set_value(
+            workbook[worksheet_name], target_cell.row, target_cell.column, repaired, changes,
+        )
+
+
 def _reject_formula_cells(sheet: Any, coordinates: set[tuple[int, int]]) -> None:
     for row, column in sorted(coordinates):
         cell = sheet.cell(row, column)
@@ -184,15 +228,20 @@ def _set_period_label(sheet: Any, label: str, period: str, changes: list[dict[st
                 return
 
 
-def _update_derived_values(sheet: Any, row: int, headers: dict[str, int], changes: list[dict[str, Any]]) -> None:
+def _update_derived_values(
+    sheet: Any, row: int, headers: dict[str, int], changes: list[dict[str, Any]],
+) -> dict[str, float | int]:
+    calculated: dict[str, float | int] = {}
+
     def value(header: str) -> float:
         column = headers.get(header)
         return _number(sheet.cell(row, column).value) if column else 0.0
 
     def update(header: str, amount: float) -> None:
+        calculated[header] = _money(amount)
         column = headers.get(header)
         if column:
-            _set_value(sheet, row, column, _money(amount), changes)
+            _set_value_preserving_formula(sheet, row, column, calculated[header], changes)
 
     unit_social = value("单位社保合计")
     personal_social = value("个人社保合计")
@@ -210,56 +259,73 @@ def _update_derived_values(sheet: Any, row: int, headers: dict[str, int], change
     update("实发工资", net)
     update("代收代付", pass_through)
     update("合计", total)
+    return calculated
 
 
-def _update_total_row(sheet: Any, header_row: int, total_row: int, headers: dict[str, int], changes: list[dict[str, Any]]) -> None:
+def _update_total_row(
+    sheet: Any,
+    header_row: int,
+    total_row: int,
+    headers: dict[str, int],
+    calculated_rows: dict[int, dict[str, float | int]],
+    changes: list[dict[str, Any]],
+) -> dict[str, float | int]:
     first_employee_row = header_row + 1
-    _set_value(sheet, total_row, 1, "*合计*", changes)
+    calculated_totals: dict[str, float | int] = {}
+
+    def row_value(row: int, header: str, column: int) -> float:
+        calculated = calculated_rows.get(row, {})
+        if header in calculated:
+            return float(calculated[header])
+        return _number(sheet.cell(row, column).value)
+
+    _set_value_preserving_formula(sheet, total_row, 1, "*合计*", changes)
     for marker_header in ("姓名", "证件类型", "状态"):
         column = headers.get(marker_header)
         if column:
-            _set_value(sheet, total_row, column, "79", changes)
+            _set_value_preserving_formula(sheet, total_row, column, "79", changes)
     for header, column in headers.items():
         if header not in FINANCIAL_HEADERS:
             continue
-        total = sum(_number(sheet.cell(row, column).value) for row in range(first_employee_row, total_row))
-        _set_value(sheet, total_row, column, _money(total), changes)
+        total = sum(row_value(row, header, column) for row in range(first_employee_row, total_row))
+        calculated_totals[header] = _money(total)
+        _set_value_preserving_formula(
+            sheet, total_row, column, calculated_totals[header], changes,
+        )
+    return calculated_totals
 
 
 def _update_notice(
     notice: Any,
     period: str,
     employee_count: int,
-    detail: Any,
-    detail_headers: dict[str, int],
-    total_row: int,
+    detail_totals: dict[str, float | int],
     changes: list[dict[str, Any]],
 ) -> None:
     _set_period_label(notice, "费用所属期间：", period, changes)
 
     def total(header: str) -> float:
-        column = detail_headers.get(header)
-        return _number(detail.cell(total_row, column).value) if column else 0.0
+        return float(detail_totals.get(header, 0.0))
 
     special_counts = {"社保小计", "残保金企业", "公积金小计"}
     for row in range(1, notice.max_row + 1):
         raw_label = _normalize_text(notice.cell(row, 1).value)
         label = raw_label.rstrip("：:")
         if label == "管理费":
-            _set_value(notice, row, 5, _money(total("管理费")), changes)
+            _set_value_preserving_formula(notice, row, 5, _money(total("管理费")), changes)
         elif label == "本期总计应付款":
-            _set_value(notice, row, 5, _money(total("合计")), changes)
+            _set_value_preserving_formula(notice, row, 5, _money(total("合计")), changes)
         elif label == "人民币大写":
-            _set_value(notice, row, 5, _rmb_upper(total("合计")), changes)
-        elif label in detail_headers:
-            _set_value(notice, row, 5, "79" if label in special_counts else employee_count, changes)
-            _set_value(notice, row, 6, _money(total(label)), changes)
+            _set_value_preserving_formula(notice, row, 5, _rmb_upper(total("合计")), changes)
+        elif label in detail_totals:
+            _set_value_preserving_formula(notice, row, 5, "79" if label in special_counts else employee_count, changes)
+            _set_value_preserving_formula(notice, row, 6, _money(total(label)), changes)
         elif label == "社保小计":
-            _set_value(notice, row, 5, "79", changes)
-            _set_value(notice, row, 6, _money(total("单位社保合计") + total("个人社保合计")), changes)
+            _set_value_preserving_formula(notice, row, 5, "79", changes)
+            _set_value_preserving_formula(notice, row, 6, _money(total("单位社保合计") + total("个人社保合计")), changes)
         elif label == "公积金小计":
-            _set_value(notice, row, 5, "79", changes)
-            _set_value(notice, row, 6, _money(total("基本公积金企业") + total("基本公积金个人")), changes)
+            _set_value_preserving_formula(notice, row, 5, "79", changes)
+            _set_value_preserving_formula(notice, row, 6, _money(total("基本公积金企业") + total("基本公积金个人")), changes)
 
 
 def sync_master_to_source_roster(
@@ -347,7 +413,7 @@ def sync_master_to_source_roster(
 
         employee_write_headers = {
             "序号", "薪资所属月", "社保所属月", "公积金所属月",
-            *SOURCE_TO_TARGET_HEADERS.values(), *DERIVED_HEADERS,
+            *SOURCE_TO_TARGET_HEADERS.values(),
         }
         target_formula_coordinates = {
             (row, target_headers[header])
@@ -356,25 +422,17 @@ def sync_master_to_source_roster(
             for header in employee_write_headers
             if header in target_headers
         }
-        target_formula_coordinates.update(
-            (total_row, column)
-            for header, column in target_headers.items()
-            if header in FINANCIAL_HEADERS
-        )
         _reject_formula_cells(target_ws, target_formula_coordinates)
-        if "付款通知书" in master.sheetnames:
-            notice = master["付款通知书"]
-            notice_formula_coordinates: set[tuple[int, int]] = set()
-            for row in range(1, notice.max_row + 1):
-                label = _normalize_text(notice.cell(row, 1).value).rstrip("：:")
-                if label in target_headers or label in {"社保小计", "公积金小计"}:
-                    notice_formula_coordinates.update({(row, 5), (row, 6)})
-                elif label in {"管理费", "本期总计应付款", "人民币大写"}:
-                    notice_formula_coordinates.add((row, 5))
-            _reject_formula_cells(notice, notice_formula_coordinates)
 
         removed_names = [target_display_names[name] for name in target_rows if name not in source_records]
         rows_to_delete = sorted((target_rows[name] for name in target_rows if name not in source_records), reverse=True)
+        formula_snapshot = [
+            (worksheet.title, cell.coordinate, cell.value)
+            for worksheet in master.worksheets
+            for cells in worksheet.iter_rows()
+            for cell in cells
+            if isinstance(cell.value, str) and cell.value.startswith("=")
+        ]
         for row in rows_to_delete:
             target_ws.delete_rows(row, 1)
         if rows_to_delete:
@@ -384,9 +442,25 @@ def sync_master_to_source_roster(
                 "deleted_rows": sorted(rows_to_delete),
                 "removed_names": removed_names,
             })
+            _repair_formulas_after_row_delete(
+                master,
+                target_sheet=target_sheet,
+                deleted_rows=rows_to_delete,
+                formula_snapshot=formula_snapshot,
+                changes=changes,
+            )
+            try:
+                WorkbookSession._repair_row_dependent_objects(
+                    master,
+                    target_sheet=target_sheet,
+                    deleted_rows=rows_to_delete,
+                )
+            except ValueError as exc:
+                raise RosterSyncError("删除非名单人员会破坏模板范围对象，已回滚本批") from exc
 
         total_row -= len(rows_to_delete)
         retained_names: list[str] = []
+        calculated_rows: dict[int, dict[str, float | int]] = {}
         for sequence, row in enumerate(range(target_header_row + 1, total_row), start=1):
             display_name = str(target_ws.cell(row, target_name_column).value or "").strip()
             normalized_name = _normalize_text(display_name)
@@ -408,15 +482,18 @@ def sync_master_to_source_roster(
                     continue
                 source_value = record.get(source_header)
                 _set_value(target_ws, row, target_column, 0 if source_value in (None, "") else source_value, changes)
-            _update_derived_values(target_ws, row, target_headers, changes)
+            calculated_rows[row] = _update_derived_values(
+                target_ws, row, target_headers, changes,
+            )
 
         _set_period_label(target_ws, "结算月：", period, changes)
         _set_period_label(target_ws, "所属月：", period, changes)
-        _update_total_row(target_ws, target_header_row, total_row, target_headers, changes)
+        detail_totals = _update_total_row(
+            target_ws, target_header_row, total_row, target_headers, calculated_rows, changes,
+        )
         if "付款通知书" in master.sheetnames:
             _update_notice(
-                master["付款通知书"], period, len(retained_names), target_ws,
-                target_headers, total_row, changes,
+                master["付款通知书"], period, len(retained_names), detail_totals, changes,
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)

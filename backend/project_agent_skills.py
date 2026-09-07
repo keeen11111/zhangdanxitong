@@ -45,6 +45,9 @@ _SKILL_ROUTES: Final = (
             "保留模板公式和范围外内容，随后重新读取目标范围或运行已注册校验。"
         ),
         "runtime_mode": "registered_tools_only",
+        # These names are executable acceptance gates, not prompt advice.
+        # A workbook run cannot complete until both tools actually succeed.
+        "required_validation_tools": ["validate_workbook", "validate_with_officecli"],
     },
     {
         "id": "data-cleaning",
@@ -97,6 +100,64 @@ _SKILL_ROUTES: Final = (
         "runtime_mode": "reference_only",
     },
 )
+
+
+def select_project_skills(run: dict[str, object], skill_root: Path = PROJECT_AGENT_SKILL_ROOT) -> dict[str, object]:
+    """Select applicable project routes and expose their execution contract.
+
+    Skill selection is deterministic and persisted with the run.  The model may
+    use the selected route as guidance, but only registered runtime tools can
+    satisfy a route's gates; reference-only routes remain explicitly pending
+    human/document-tool confirmation.
+    """
+    context = render_project_skill_context(skill_root)
+    instruction = str(run.get("instruction") or "").lower()
+    filenames = " ".join(
+        str(item.get("filename") or "")
+        for item in (run.get("file_manifest") or [])
+        if isinstance(item, dict)
+    ).lower()
+    issue_types = " ".join(
+        str(item.get("issue_type") or "")
+        for item in (run.get("items") or [])
+        if isinstance(item, dict)
+    ).lower()
+    signal = f"{instruction} {filenames} {issue_types}"
+    selected: list[dict[str, object]] = []
+    for route in context["task_routing"]:
+        route_id = str(route.get("id") or "")
+        if route_id == "workbook-update":
+            applies = True
+        elif route_id == "data-cleaning":
+            applies = any(term in signal for term in ("姓名", "人员", "工号", "匹配", "重复", "unmatched", "duplicate"))
+        elif route_id == "document-evidence":
+            applies = any(ext in signal for ext in (".pdf", ".docx", ".doc", "合同", "发票", "扫描"))
+        elif route_id == "settlement-bill-review":
+            applies = any(term in signal for term in ("账单", "结算单", "合同", "invoice", "billing"))
+        elif route_id == "payment-reconciliation":
+            applies = any(term in signal for term in ("回款", "流水", "核销", "reconciliation", "payment"))
+        elif route_id == "month-end-close":
+            applies = any(term in signal for term in ("月", "结算", "工资", "close", "payroll"))
+        else:
+            applies = False
+        if applies:
+            selected.append(route)
+    runtime_routes = [route["id"] for route in selected if route.get("runtime_mode") == "registered_tools_only"]
+    reference_only_routes = [route["id"] for route in selected if route.get("runtime_mode") == "reference_only"]
+    required_validation_tools = sorted({
+        str(tool)
+        for route in selected
+        for tool in (route.get("required_validation_tools") or [])
+    })
+    return {
+        "installed_skills": context["installed_skills"],
+        "selected_routes": [str(route["id"]) for route in selected],
+        "routes": selected,
+        "runtime_routes": runtime_routes,
+        "reference_only_routes": reference_only_routes,
+        "required_validation_tools": required_validation_tools,
+        "execution_policy": context["execution_policy"],
+    }
 
 
 def _skill_body(skill_file: Path) -> str:

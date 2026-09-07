@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import openpyxl
+import pytest
 
 from backend.natural_language_rules import apply_supported_workbook_rules, parse_supported_workbook_rule
 
@@ -96,6 +97,28 @@ def test_replaces_duty_days_clears_unmatched_people_and_preserves_formulas(tmp_p
     assert sheet["D4"].value is None
     assert sheet["E2"].value == "=C2*D2"
     workbook.close()
+
+
+def test_duty_count_rule_rolls_back_when_workbook_save_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft_path, source_path = _workbooks(tmp_path)
+    before = draft_path.read_bytes()
+
+    def fail_after_partial_write(_workbook, filename) -> None:
+        Path(filename).write_bytes(b"partial workbook")
+        raise OSError("disk interrupted")
+
+    monkeypatch.setattr(openpyxl.workbook.workbook.Workbook, "save", fail_after_partial_write)
+
+    with pytest.raises(OSError, match="disk interrupted"):
+        apply_supported_workbook_rules(
+            instruction=INSTRUCTION,
+            draft_path=draft_path,
+            source_paths={source_path.name: source_path},
+        )
+
+    assert draft_path.read_bytes() == before
 
 
 def test_does_not_clear_any_value_when_source_cannot_be_uniquely_matched(tmp_path: Path) -> None:

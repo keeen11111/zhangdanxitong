@@ -712,7 +712,7 @@ def test_background_workflow_reaches_a_downloadable_terminal_result(tmp_path, mo
     )
 
 
-def test_background_workflow_automatically_continues_after_a_zero_write_segment(tmp_path, monkeypatch) -> None:
+def test_background_workflow_stops_after_a_zero_write_segment_until_user_resumes(tmp_path, monkeypatch) -> None:
     import openpyxl
 
     run_id = "e" * 32
@@ -738,21 +738,10 @@ def test_background_workflow_automatically_continues_after_a_zero_write_segment(
         nonlocal calls
         calls += 1
         current = agent._load_run(current_run_id, user)
-        if calls == 1:
-            current.update({
-                "status": "execution_incomplete",
-                "execution_result": {"status": "execution_incomplete", "code": "NO_WRITES_PERFORMED"},
-            })
-            agent._save_run(current)
-            return agent._public_run(current)
-        output = tmp_path / "continued.xlsx"
-        workbook = openpyxl.Workbook()
-        workbook.save(output)
-        workbook.close()
         current.update({
-            "status": "awaiting_review", "draft_filename": output.name,
-            "execution_result": {"status": "completed", "content": "完成"},
-            "workbook_updates": [],
+            "status": "execution_incomplete",
+            "code": "NO_WRITES_PERFORMED",
+            "execution_result": {"status": "execution_incomplete", "code": "NO_WRITES_PERFORMED"},
         })
         agent._save_run(current)
         return agent._public_run(current)
@@ -761,12 +750,586 @@ def test_background_workflow_automatically_continues_after_a_zero_write_segment(
     agent._run_agent_workflow(run_id, "tenant-a")
 
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
-    assert calls == 2
-    assert completed["status"] == "completed"
-    assert any(event.get("payload", {}).get("stage") == "segment_resume" for event in completed["events"])
+    assert calls == 1
+    assert completed["status"] == "execution_incomplete"
+    assert completed["code"] == "NO_WRITES_PERFORMED"
+    assert not any(event.get("type") == "run_completed" for event in completed["events"])
+    assert not any(event.get("payload", {}).get("stage") == "segment_resume" for event in completed["events"])
+    assert any(event.get("payload", {}).get("stage") == "resumable" for event in completed["events"])
 
 
-def test_background_workflow_keeps_resuming_past_the_legacy_six_segment_limit(tmp_path, monkeypatch) -> None:
+def test_background_workflow_keeps_explicit_target_month_when_filename_month_differs(
+    tmp_path, monkeypatch,
+) -> None:
+    run_id = "f" * 32
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
+    monkeypatch.setattr(agent, "_material_context", lambda _run: [])
+
+    class FakeDb:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(agent, "SessionLocal", FakeDb)
+    monkeypatch.setattr(agent.ModelConfig, "from_env", lambda: object())
+    monkeypatch.setattr(agent.ModelConfig, "fallback_from_env", lambda: None)
+    agent._save_run({
+        "run_id": run_id, "tenant_id": "tenant-a", "project_id": "project-a",
+        "status": "planning", "instruction": "生成五月数据", "events": [], "items": [],
+        "salary_month": "2026.05", "target_salary_month": "2026.05",
+        "month_authority": "explicit",
+        "model_plan": {"summary": "计划", "steps": ["写入"], "questions": []},
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "month_confirmation": {
+            "required": True, "confirmed": False,
+            "configured_month": "2026.05", "filename_month": "2026.04",
+        },
+    })
+    observed_months: list[str] = []
+
+    def fake_execute(current_run_id, user, db):
+        current = agent._load_run(current_run_id, user)
+        observed_months.append(str(current.get("salary_month")))
+        current.update({
+            "status": "execution_incomplete", "code": "VALIDATION_FAILED",
+            "execution_result": {"status": "execution_incomplete", "code": "VALIDATION_FAILED"},
+        })
+        agent._save_run(current)
+        return agent._public_run(current)
+
+    monkeypatch.setattr(agent, "_execute_agent_run_sync", fake_execute)
+    agent._run_agent_workflow(run_id, "tenant-a")
+
+    completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
+    assert observed_months == ["2026.05"]
+    assert completed["salary_month"] == "2026.05"
+    assert completed["target_salary_month"] == "2026.05"
+
+
+def test_background_workflow_preserves_month_question_without_resolved_target(
+    tmp_path, monkeypatch,
+) -> None:
+    run_id = "a" * 32
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
+    monkeypatch.setattr(agent, "_material_context", lambda _run: [])
+
+    class FakeDb:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(agent, "SessionLocal", FakeDb)
+    monkeypatch.setattr(agent.ModelConfig, "from_env", lambda: object())
+    monkeypatch.setattr(agent.ModelConfig, "fallback_from_env", lambda: None)
+    agent._save_run({
+        "run_id": run_id, "tenant_id": "tenant-a", "project_id": "project-a",
+        "status": "planning", "instruction": "处理这批文件", "events": [], "items": [],
+        "month_authority": "ambiguous_instruction", "draft_filename": "checkpoint.xlsx",
+        "model_plan": {
+            "summary": "计划", "steps": ["写入"],
+            "questions": ["目标处理月份是2026年4月还是2026年5月？"],
+        },
+        "plan_confirmation": {"required": True, "confirmed": False},
+        "month_confirmation": {"required": True, "confirmed": False},
+    })
+    execution_calls: list[str] = []
+    monkeypatch.setattr(
+        agent, "_execute_agent_run_sync",
+        lambda current_run_id, *_args: execution_calls.append(current_run_id),
+    )
+
+    agent._run_agent_workflow(run_id, "tenant-a")
+
+    blocked = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
+    assert blocked["status"] == "awaiting_review"
+    assert blocked["model_plan"]["questions"] == ["目标处理月份是2026年4月还是2026年5月？"]
+    assert execution_calls == []
+
+
+def test_finalize_rejects_a_readable_draft_without_data_writes(tmp_path, monkeypatch) -> None:
+    run_id = "zero-write-finalize"
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    output = tmp_path / "draft.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "模板"
+    workbook.save(output)
+    workbook.close()
+
+    run = {
+        "run_id": run_id,
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "status": "awaiting_review",
+        "draft_filename": output.name,
+        "events": [],
+        "items": [],
+        "workbook_updates": [],
+        "execution_result": {"status": "completed", "content": "已完成"},
+    }
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "execution_incomplete"
+    assert run["code"] == "NO_WRITES_PERFORMED"
+    assert run["validation"]["status"] == "not_verified"
+
+
+def test_draft_acceptance_rejects_a_total_formula_that_omits_an_employee(
+    tmp_path,
+) -> None:
+    output = tmp_path / "bad-summary-range.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "明细"
+    sheet.append(["工号", "姓名", "应发工资"])
+    sheet.append(["E001", "甲", 100])
+    sheet.append(["E002", "乙", 200])
+    sheet.append(["合计", None, "=SUM(C2:C2)"])
+    workbook.save(output)
+    workbook.close()
+
+    acceptance = agent._inspect_draft_acceptance(output)
+
+    assert acceptance["passed"] is False
+    assert acceptance["summary_range_errors"] == [{
+        "sheet": "明细", "cell": "C4", "formula": "=SUM(C2:C2)",
+        "expected_rows": "2:3", "actual_rows": "2:2",
+    }]
+
+
+def test_draft_acceptance_avoids_read_only_random_cell_access(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    output = tmp_path / "acceptance-performance.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["工号", "姓名", "应发工资"])
+    sheet.append(["E001", "甲", 100])
+    sheet.append(["合计", None, "=SUM(C2:C2)"])
+    workbook.save(output)
+    workbook.close()
+    real_load_workbook = agent.openpyxl.load_workbook
+    load_options: list[dict] = []
+
+    def recording_load_workbook(*args, **kwargs):
+        load_options.append(dict(kwargs))
+        return real_load_workbook(*args, **kwargs)
+
+    monkeypatch.setattr(agent.openpyxl, "load_workbook", recording_load_workbook)
+
+    agent._inspect_draft_acceptance(output)
+
+    assert len(load_options) == 2
+    assert all(options.get("read_only") is False for options in load_options)
+
+
+def test_roster_acceptance_avoids_read_only_random_cell_access(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    output = tmp_path / "roster-acceptance-performance.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "明细"
+    sheet.append(["序号", "姓名"])
+    sheet.append([1, "甲"])
+    sheet.append([2, "乙"])
+    sheet.append(["*合计*", None])
+    workbook.save(output)
+    workbook.close()
+    real_load_workbook = agent.openpyxl.load_workbook
+    load_options: list[dict] = []
+
+    def recording_load_workbook(*args, **kwargs):
+        load_options.append(dict(kwargs))
+        return real_load_workbook(*args, **kwargs)
+
+    monkeypatch.setattr(agent.openpyxl, "load_workbook", recording_load_workbook)
+    result = agent._verify_roster_acceptance({
+        "instruction": "以派遣名单为准",
+        "roster_sync": {
+            "retained_names": ["甲", "乙"],
+            "target_sheet": "明细",
+        },
+    }, output)
+
+    assert result["passed"] is True
+    assert load_options == [{"read_only": False, "data_only": False}]
+
+
+def test_draft_acceptance_accepts_split_ranges_that_cover_every_employee(
+    tmp_path,
+) -> None:
+    output = tmp_path / "split-summary-range.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "明细"
+    sheet.append(["工号", "姓名", "应发工资"])
+    sheet.append(["E001", "甲", 100])
+    sheet.append(["E002", "乙", 200])
+    sheet.append(["合计", None, "=SUM(C2:C2)+SUM(C3:C3)"])
+    workbook.save(output)
+    workbook.close()
+
+    acceptance = agent._inspect_draft_acceptance(output)
+
+    assert acceptance["summary_range_errors"] == []
+    assert acceptance["passed"] is True
+
+
+def test_draft_acceptance_rejects_a_total_formula_that_includes_itself(
+    tmp_path,
+) -> None:
+    output = tmp_path / "self-referencing-summary.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "明细"
+    sheet.append(["工号", "姓名", "应发工资"])
+    sheet.append(["E001", "甲", 100])
+    sheet.append(["E002", "乙", 200])
+    sheet.append(["合计", None, "=SUM(C:C)"])
+    workbook.save(output)
+    workbook.close()
+
+    acceptance = agent._inspect_draft_acceptance(output)
+
+    assert acceptance["passed"] is False
+    assert acceptance["summary_range_errors"][0]["cell"] == "C4"
+    assert acceptance["summary_range_errors"][0]["reason"] == "summary_range_includes_total"
+
+
+def test_draft_acceptance_rejects_a_formula_that_references_a_missing_sheet(
+    tmp_path,
+) -> None:
+    output = tmp_path / "missing-sheet-reference.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "='不存在的表'!A1"
+    workbook.save(output)
+    workbook.close()
+
+    acceptance = agent._inspect_draft_acceptance(output)
+
+    assert acceptance["passed"] is False
+    assert acceptance["formula_errors"] == [{
+        "sheet": "Sheet", "cell": "A1", "error": "missing_sheet_reference",
+        "referenced_sheet": "不存在的表",
+    }]
+
+
+def _cross_month_finalize_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    baseline = tmp_path / "april-accepted.xlsx"
+    output = tmp_path / "may-draft.xlsx"
+    for path in (baseline, output):
+        workbook = openpyxl.Workbook()
+        workbook.active.title = "汇总"
+        workbook.active["A2"] = "5月" if path == output else "4月"
+        workbook.active["B2"] = 100 if path == output else 50
+        if path == output:
+            workbook.active["A3"] = "4月"
+            workbook.active["B3"] = 50
+            workbook.active["A4"] = "3月"
+            workbook.active["B4"] = 40
+        workbook.save(path)
+        workbook.close()
+    baseline_sha = agent.file_digest(baseline)
+    run = {
+        "run_id": "month-finalize", "project_id": "project-a",
+        "status": "awaiting_review", "draft_filename": output.name,
+        "salary_month": "2026.05", "target_salary_month": "2026.05",
+        "instruction": "新增5月并更新本月数据", "events": [], "items": [],
+        "requires_month_roll_forward": True,
+        "baseline": {"salary_month": "2026.04", "sha256": baseline_sha},
+        "month_roll_forward": {
+            "sheet": "汇总", "current_row": 2, "history_row": 3,
+            "new_month": "5月", "target_salary_month": "2026.05",
+            "baseline_sha256": baseline_sha,
+            "history_values": {"A3": "4月", "B3": 50},
+            "history_snapshot": {
+                "A3": "4月", "B3": 50,
+                "A4": "3月", "B4": 40,
+            },
+        },
+        "_immutable_inputs": [{
+            "role": "previous_accepted_result", "path": str(baseline), "sha256": baseline_sha,
+        }],
+        "workbook_updates": [
+            {"rule": "roll_forward_month", "sheet": "汇总", "inserted_row": 2, "history_row": 3},
+            {"target_sheet": "汇总", "target_cell": "B2", "old_value": 50, "new_value": 100},
+        ],
+        "execution_result": {"status": "completed", "content": "完成"},
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "model_plan": {"steps": ["滚月", "写入", "校验"], "questions": []},
+    }
+    return run, baseline, output
+
+
+def test_finalize_accepts_cross_month_run_only_when_history_and_inputs_are_unchanged(
+    tmp_path, monkeypatch,
+) -> None:
+    run, _baseline, _output = _cross_month_finalize_run(tmp_path, monkeypatch)
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "completed"
+    assert run["machine_acceptance"]["target_month_present"] is True
+    assert run["machine_acceptance"]["historical_months_unchanged"] is True
+    assert run["machine_acceptance"]["immutable_inputs_unchanged"] is True
+
+
+def test_finalize_rejects_cross_month_run_with_only_a_month_row_insert(
+    tmp_path, monkeypatch,
+) -> None:
+    run, _baseline, _output = _cross_month_finalize_run(tmp_path, monkeypatch)
+    run["workbook_updates"] = [run["workbook_updates"][0]]
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "execution_incomplete"
+    assert run["code"] == "NO_WRITES_PERFORMED"
+    assert run["machine_acceptance"]["writes_traceable"] is False
+
+
+def test_finalize_rejects_realistic_incomplete_model_report_after_row_insert(
+    tmp_path, monkeypatch,
+) -> None:
+    """A model report saying it could not write must never publish a partial row insert."""
+    output = tmp_path / "partial.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "姓名"
+    workbook.active["A2"] = "占位"
+    workbook.save(output)
+    workbook.close()
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    run = {
+        "run_id": "partial-row-insert",
+        "project_id": "project-a",
+        "status": "awaiting_review",
+        "draft_filename": output.name,
+        "salary_month": "2026.04",
+        "target_salary_month": "2026.04",
+        "instruction": "把新增人员写入总表",
+        "events": [],
+        "items": [],
+        "workbook_updates": [{
+            "sheet": "Sheet",
+            "source_row": 2,
+            "inserted_row": 3,
+            "copied_columns": 10,
+        }],
+        "execution_result": {
+            "status": "completed",
+            "content": (
+                "已插入占位行，但未能完成业务字段写入。"
+                "无法可靠写入其余工作表，必须报告阻塞缺口。"
+                "结论：本任务未完成。"
+            ),
+        },
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "model_plan": {"steps": ["插入人员", "写入业务字段", "校验"], "questions": []},
+        "validation": {"status": "not_verified"},
+    }
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "execution_incomplete"
+    assert run["code"] == "INCOMPLETE_MODEL_RESPONSE"
+
+
+def test_finalize_rejects_cross_month_run_when_frozen_history_was_changed(
+    tmp_path, monkeypatch,
+) -> None:
+    run, _baseline, output = _cross_month_finalize_run(tmp_path, monkeypatch)
+    workbook = openpyxl.load_workbook(output)
+    workbook["汇总"]["B3"] = 999
+    workbook.save(output)
+    workbook.close()
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "execution_incomplete"
+    assert run["code"] == "MONTH_HISTORY_CHANGED"
+
+
+def test_finalize_rejects_cross_month_run_when_older_history_was_changed(
+    tmp_path, monkeypatch,
+) -> None:
+    run, _baseline, output = _cross_month_finalize_run(tmp_path, monkeypatch)
+    workbook = openpyxl.load_workbook(output)
+    workbook["汇总"]["B4"] = 999
+    workbook.save(output)
+    workbook.close()
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "execution_incomplete"
+    assert run["code"] == "MONTH_HISTORY_CHANGED"
+
+
+def test_finalize_rejects_cross_month_run_when_prior_accepted_result_changed(
+    tmp_path, monkeypatch,
+) -> None:
+    run, baseline, _output = _cross_month_finalize_run(tmp_path, monkeypatch)
+    baseline.write_bytes(b"changed")
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "execution_incomplete"
+    assert run["code"] == "IMMUTABLE_INPUT_CHANGED"
+
+
+def test_finalize_requires_every_skill_validation_tool(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    output = tmp_path / "draft.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "已更新"
+    workbook.save(output)
+    workbook.close()
+    run = {
+        "run_id": "validation-finalize", "project_id": "project-a",
+        "status": "awaiting_review", "draft_filename": output.name,
+        "instruction": "更新数据", "events": [
+            {"type": "model_request", "payload": {"stage": "writing", "operation": "model_call"}},
+            {"type": "tool_result", "payload": {"name": "validate_workbook", "status": "succeeded"}},
+        ],
+        "items": [],
+        "workbook_updates": [{"target_sheet": "Sheet", "target_cell": "A1", "old_value": "旧", "new_value": "已更新"}],
+        "execution_result": {"status": "completed", "content": "完成"},
+        "execution_checkpoint": {
+            "current_stage": "completed",
+            "required_validation_tools": ["validate_workbook", "validate_with_officecli"],
+        },
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "model_plan": {"steps": ["写入"], "questions": []},
+    }
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "awaiting_review"
+    assert run["code"] == "VALIDATION_TOOL_NOT_EXECUTED"
+    assert run["validation"]["missing_validation_tools"] == ["validate_with_officecli"]
+
+
+def test_finalize_requires_skill_validations_for_deterministic_writes(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    output = tmp_path / "deterministic-draft.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "已更新"
+    workbook.save(output)
+    workbook.close()
+    run = {
+        "run_id": "deterministic-validation-finalize",
+        "project_id": "project-a",
+        "status": "awaiting_review",
+        "draft_filename": output.name,
+        "instruction": "按来源名单更新数据",
+        "events": [{
+            "type": "tool_result",
+            "payload": {
+                "name": "source_sheet_roster_sync",
+                "status": "succeeded",
+                "write_count": 1,
+            },
+        }],
+        "items": [],
+        "workbook_updates": [{
+            "target_sheet": "Sheet",
+            "target_cell": "A1",
+            "old_value": "旧",
+            "new_value": "已更新",
+        }],
+        "execution_result": {"status": "completed", "content": "完成"},
+        "execution_checkpoint": {
+            "current_stage": "completed",
+            "required_validation_tools": ["validate_workbook", "validate_with_officecli"],
+        },
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "model_plan": {"steps": ["名单同步"], "questions": []},
+    }
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "awaiting_review"
+    assert run["code"] == "VALIDATION_TOOL_NOT_EXECUTED"
+    assert run["validation"]["missing_validation_tools"] == [
+        "validate_with_officecli", "validate_workbook",
+    ]
+
+
+def test_finalize_ignores_validations_that_ran_before_the_last_write(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    output = tmp_path / "draft.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "已更新"
+    workbook.save(output)
+    workbook.close()
+    run = {
+        "run_id": "stale-validation-finalize", "project_id": "project-a",
+        "status": "awaiting_review", "draft_filename": output.name,
+        "instruction": "更新数据", "events": [
+            {"type": "model_request", "payload": {"stage": "writing", "operation": "model_call"}},
+            {"type": "tool_result", "payload": {
+                "name": "validate_workbook", "status": "succeeded",
+            }},
+            {"type": "tool_result", "payload": {
+                "name": "validate_with_officecli", "status": "succeeded",
+            }},
+            {"type": "tool_result", "payload": {
+                "name": "apply_source_cells", "status": "succeeded", "write_count": 1,
+            }},
+        ],
+        "items": [],
+        "workbook_updates": [{
+            "target_sheet": "Sheet", "target_cell": "A1",
+            "old_value": "旧", "new_value": "已更新",
+        }],
+        "execution_result": {"status": "completed", "content": "完成"},
+        "execution_checkpoint": {
+            "current_stage": "completed",
+            "required_validation_tools": ["validate_workbook", "validate_with_officecli"],
+        },
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "model_plan": {"steps": ["写入"], "questions": []},
+    }
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "awaiting_review"
+    assert run["code"] == "VALIDATION_TOOL_NOT_EXECUTED"
+    assert run["validation"]["missing_validation_tools"] == [
+        "validate_with_officecli", "validate_workbook",
+    ]
+
+
+def test_finalize_rejects_explicit_roster_scope_without_roster_evidence(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
+    output = tmp_path / "draft.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "已更新"
+    workbook.save(output)
+    workbook.close()
+    run = {
+        "run_id": "roster-finalize", "project_id": "project-a",
+        "status": "awaiting_review", "draft_filename": output.name,
+        "instruction": "以派遣名单为准，其他人员全部删除", "events": [], "items": [],
+        "workbook_updates": [{"target_sheet": "Sheet", "target_cell": "A1", "old_value": "旧", "new_value": "已更新"}],
+        "execution_result": {"status": "completed", "content": "完成"},
+        "plan_confirmation": {"required": True, "confirmed": True},
+        "model_plan": {"steps": ["名单同步"], "questions": []},
+    }
+
+    agent._finalize_agent_output(run)
+
+    assert run["status"] == "awaiting_review"
+    assert run["code"] == "ROSTER_VALIDATION_FAILED"
+
+
+def test_background_workflow_does_not_auto_resume_after_turn_limit(tmp_path, monkeypatch) -> None:
     import openpyxl
 
     run_id = "f1" * 16
@@ -795,6 +1358,7 @@ def test_background_workflow_keeps_resuming_past_the_legacy_six_segment_limit(tm
         if calls <= 7:
             current.update({
                 "status": "execution_incomplete",
+                "code": "MAX_TURNS_EXCEEDED",
                 "execution_result": {"status": "execution_incomplete", "code": "MAX_TURNS_EXCEEDED"},
             })
         else:
@@ -814,11 +1378,13 @@ def test_background_workflow_keeps_resuming_past_the_legacy_six_segment_limit(tm
     agent._run_agent_workflow(run_id, "tenant-a")
 
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
-    assert calls == 8
-    assert completed["status"] == "completed"
+    assert calls == 1
+    assert completed["status"] == "execution_incomplete"
+    assert completed["code"] == "MAX_TURNS_EXCEEDED"
+    assert not any(event.get("payload", {}).get("stage") == "segment_resume" for event in completed["events"])
 
 
-def test_background_workflow_retries_transient_model_provider_error(tmp_path, monkeypatch) -> None:
+def test_background_workflow_waits_for_user_after_model_provider_error(tmp_path, monkeypatch) -> None:
     run_id = "e2" * 16
     monkeypatch.setattr(agent, "RUN_DIR", tmp_path / "runs")
     monkeypatch.setattr(agent, "_result_path", lambda _project, filename: tmp_path / filename)
@@ -845,6 +1411,7 @@ def test_background_workflow_retries_transient_model_provider_error(tmp_path, mo
         if calls == 1:
             current.update({
                 "status": "execution_incomplete",
+                "code": "MODEL_PROVIDER_ERROR",
                 "execution_result": {"status": "execution_incomplete", "code": "MODEL_PROVIDER_ERROR"},
             })
         else:
@@ -860,6 +1427,7 @@ def test_background_workflow_retries_transient_model_provider_error(tmp_path, mo
     agent._run_agent_workflow(run_id, "tenant-a")
 
     completed = agent._load_run(run_id, SimpleNamespace(tenant_id="tenant-a"))
-    assert calls == 2
-    assert completed["status"] == "completed"
-    assert any(event.get("payload", {}).get("reason") == "MODEL_PROVIDER_ERROR" for event in completed["events"])
+    assert calls == 1
+    assert completed["status"] == "execution_incomplete"
+    assert completed["code"] == "MODEL_PROVIDER_ERROR"
+    assert not any(event.get("payload", {}).get("stage") == "segment_resume" for event in completed["events"])

@@ -3,6 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import openpyxl
+from openpyxl.chart import BarChart, Reference
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.table import Table
 import pytest
 
 
@@ -140,6 +145,108 @@ def test_sync_master_to_source_roster_uses_only_the_selected_sheet(tmp_path: Pat
     workbook.close()
 
 
+def test_sync_preserves_and_repairs_formulas_after_removing_non_roster_rows(
+    tmp_path: Path,
+) -> None:
+    from backend.roster_sync import sync_master_to_source_roster
+
+    master = tmp_path / "master.xlsx"
+    source = tmp_path / "source.xlsx"
+    output = tmp_path / "output.xlsx"
+    _create_master(master)
+    _create_source(source)
+    workbook = openpyxl.load_workbook(master)
+    detail = workbook["明细"]
+    gross_column = DETAIL_HEADERS.index("应发工资") + 1
+    total_column = DETAIL_HEADERS.index("合计") + 1
+    for row in range(3, 6):
+        detail.cell(row, gross_column).value = f"=K{row}+L{row}"
+    detail.cell(6, gross_column).value = f"=SUM(AG3:AG5)"
+    workbook["付款通知书"]["E16"] = f"='明细'!AO6"
+    summary = workbook.create_sheet("汇总")
+    summary["A1"] = "=SUM('明细'!K3:K5)"
+    workbook.save(master)
+    workbook.close()
+
+    sync_master_to_source_roster(
+        master_path=master,
+        source_path=source,
+        output_path=output,
+        source_sheet="派遣",
+        target_sheet="明细",
+        target_period="2026-07",
+    )
+
+    updated = openpyxl.load_workbook(output, data_only=False)
+    try:
+        detail = updated["明细"]
+        assert detail.cell(3, gross_column).value == "=K3+L3"
+        assert detail.cell(4, gross_column).value == "=K4+L4"
+        assert detail.cell(5, gross_column).value == "=SUM(AG3:AG4)"
+        assert updated["付款通知书"]["E16"].value == "='明细'!AO5"
+        assert updated["汇总"]["A1"].value == "=SUM('明细'!K3:K4)"
+        assert detail.cell(5, total_column).value is not None
+    finally:
+        updated.close()
+
+
+def test_sync_repairs_template_objects_after_removing_non_roster_rows(
+    tmp_path: Path,
+) -> None:
+    from backend.roster_sync import sync_master_to_source_roster
+
+    master = tmp_path / "master.xlsx"
+    source = tmp_path / "source.xlsx"
+    output = tmp_path / "output.xlsx"
+    _create_master(master)
+    _create_source(source)
+    workbook = openpyxl.load_workbook(master)
+    detail = workbook["明细"]
+    detail.add_table(Table(displayName="PayrollTable", ref="A2:AO6"))
+    detail.auto_filter.ref = "A2:AO6"
+    validation = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0")
+    validation.add("K3:K5")
+    detail.add_data_validation(validation)
+    detail.conditional_formatting.add(
+        "K3:K5", CellIsRule(operator="greaterThan", formula=["0"]),
+    )
+    workbook.defined_names.add(DefinedName(
+        "PayrollRows", attr_text="'明细'!$A$3:$AO$5",
+    ))
+    chart = BarChart()
+    chart.add_data(Reference(detail, min_col=11, min_row=2, max_row=5), titles_from_data=True)
+    chart.set_categories(Reference(detail, min_col=2, min_row=3, max_row=5))
+    detail.add_chart(chart, "AQ2")
+    workbook.save(master)
+    workbook.close()
+    original_bytes = master.read_bytes()
+
+    sync_master_to_source_roster(
+        master_path=master,
+        source_path=source,
+        output_path=output,
+        source_sheet="派遣",
+        target_sheet="明细",
+        target_period="2026-07",
+    )
+
+    assert master.read_bytes() == original_bytes
+    updated = openpyxl.load_workbook(output, data_only=False)
+    try:
+        detail = updated["明细"]
+        assert detail.tables["PayrollTable"].ref == "A2:AO5"
+        assert detail.auto_filter.ref == "A2:AO5"
+        assert str(detail.data_validations.dataValidation[0].sqref) == "K3:K4"
+        conditional_ranges = [str(item.sqref) for item in detail.conditional_formatting]
+        assert conditional_ranges == ["K3:K4"]
+        assert updated.defined_names["PayrollRows"].attr_text == "'明细'!$A$3:$AO$4"
+        series = detail._charts[0].series[0]
+        assert series.val.numRef.f == "'明细'!$K$3:$K$4"
+        assert series.cat.numRef.f == "'明细'!$B$3:$B$4"
+    finally:
+        updated.close()
+
+
 def test_sync_rejects_a_source_person_missing_from_the_master_without_output(tmp_path: Path) -> None:
     from backend.roster_sync import RosterSyncError, sync_master_to_source_roster
 
@@ -229,7 +336,89 @@ def test_agent_completes_an_explicit_roster_scoped_run_without_a_model_write_loo
 
     assert output.is_file()
     assert run["status"] == "awaiting_review"
-    assert run["execution_result"]["status"] == "completed"
+    assert run["execution_result"]["status"] == "execution_incomplete"
+    assert run["execution_result"]["code"] == "VALIDATION_FAILED"
     assert run["roster_sync"]["employee_count"] == 2
     assert run["roster_sync"]["source_sheet"] == "派遣"
     assert run["workbook_updates"]
+
+
+def test_deterministic_roster_sync_executes_skill_validations_after_the_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import backend.agent_execution as execution
+    from core.document_agent.orchestrator import ToolRegistry
+
+    master = tmp_path / "master.xlsx"
+    source = tmp_path / "source.xlsx"
+    output = tmp_path / "Agent草稿.xlsx"
+    _create_master(master)
+    _create_source(source)
+    monkeypatch.setattr(execution.ModelConfig, "from_env", lambda: None)
+    monkeypatch.setattr(execution.ModelConfig, "fallback_from_env", lambda: None)
+    validation_calls: list[str] = []
+    emitted: list[tuple[str, dict]] = []
+    registry = ToolRegistry()
+
+    def validate_workbook() -> dict:
+        validation_calls.append("validate_workbook")
+        return {
+            "readable": True,
+            "unresolved_item_count": 0,
+            "formula_errors": [],
+            "summary_range_errors": [],
+            "duplicate_identities": [],
+            "identity_errors": [],
+            "can_publish": True,
+        }
+
+    def validate_with_officecli() -> dict:
+        validation_calls.append("validate_with_officecli")
+        return {
+            "valid": True,
+            "recalculated": True,
+            "formula_errors": [],
+            "unevaluated_formulas": [],
+        }
+
+    registry.register("validate_workbook", validate_workbook)
+    registry.register("validate_with_officecli", validate_with_officecli)
+    run = {
+        "run_id": "v" * 32,
+        "master_file": master.name,
+        "salary_month": "2026.07",
+        "instruction": "只保留变更表格派遣 sheet 的人员，其他人员全部删除",
+        "_master_path": str(master),
+        "_source_paths": {source.name: str(source)},
+        "file_manifest": [],
+        "workbook_updates": [],
+        "messages": [],
+        "model_plan": {"steps": []},
+    }
+
+    execution.execute_model_plan(
+        run,
+        draft=output,
+        registry=registry,
+        read_schemas=[],
+        materials=[],
+        rules={},
+        save=lambda _run: None,
+        emit=lambda _run, event_type, payload, **_kwargs: emitted.append((event_type, payload)),
+    )
+
+    assert validation_calls == ["validate_workbook", "validate_with_officecli"]
+    checkpoint = run["execution_checkpoint"]
+    assert checkpoint["required_validation_tools"] == [
+        "validate_workbook", "validate_with_officecli",
+    ]
+    assert checkpoint["completed_steps"] == [
+        "validate_workbook", "validate_with_officecli",
+    ]
+    tool_results = [payload for event_type, payload in emitted if event_type == "tool_result"]
+    assert [payload["name"] for payload in tool_results] == [
+        "source_sheet_roster_sync", "validate_workbook", "validate_with_officecli",
+    ]
+    assert tool_results[0]["write_count"] > 0
+    assert all(payload["status"] == "succeeded" for payload in tool_results)
+    assert run["execution_result"]["status"] == "completed"

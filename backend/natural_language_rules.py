@@ -4,8 +4,10 @@ from __future__ import annotations
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any, Mapping
 
 import openpyxl
@@ -288,7 +290,16 @@ def apply_supported_workbook_rules(
                     "source_file": source_name, "source_sheet": source_sheet_name,
                     "source_row": "值班人员姓名出现次数",
                 })
-        workbook.save(draft_path)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix="agent-natural-rule-", suffix=".xlsx", dir=draft_path.parent,
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary)
+        try:
+            workbook.save(temporary_path)
+            os.replace(temporary_path, draft_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
     finally:
         workbook.close()
     unmatched_names = [name for _, name in target_rows if name not in counts]

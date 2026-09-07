@@ -21,6 +21,7 @@ ToolName = Literal[
     "copy_formula_from_reference", "validate_workbook", "validate_with_officecli", "rollback_work_item",
     "publish_workbook",
     "insert_and_copy_row", "delete_rows",
+    "roll_forward_month",
     "run_basic_payroll_processor", "run_keyuan_workflow",
 ]
 ToolCallStatus = Literal["pending", "running", "succeeded", "failed"]

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { agentProgress, agentShortcutAction, canResumeDirectWrite, isResumableAgentRun, nextPendingAgentItem, timelineForRun, visibleAgentItems } from "./agent-workflow.ts";
-import type { AgentWorkItem } from "./api";
+import { agentProgress, agentShortcutAction, canResumeDirectWrite, defaultTargetSalaryMonth, isResumableAgentRun, nextPendingAgentItem, timelineForRun, visibleAgentItems } from "./agent-workflow.ts";
+import type { AgentRun, AgentWorkItem } from "./api";
 
 const items: AgentWorkItem[] = [
   { item_id: "a", status: "applied", person_name: "甲" },
@@ -38,6 +38,37 @@ test("timeline turns unresolved people into direct review prompts", () => {
 test("an incomplete execution remains resumable without review items", () => {
   assert.equal(isResumableAgentRun({ run_id: "run", project_id: "p", status: "execution_incomplete" }), true);
   assert.equal(isResumableAgentRun({ run_id: "run", project_id: "p", status: "review" }), false);
+});
+
+test("a new run defaults to the month after the latest accepted run", () => {
+  const runs: AgentRun[] = [
+    {
+      run_id: "may", project_id: "p", status: "completed", salary_month: "2026.05",
+      validation: { status: "structurally_valid" },
+    },
+    {
+      run_id: "april", project_id: "p", status: "completed", salary_month: "2026.04",
+      validation: { status: "passed" },
+    },
+  ];
+
+  assert.equal(defaultTargetSalaryMonth("2026.04", runs), "2026-06");
+  assert.equal(defaultTargetSalaryMonth("2026.12", []), "2026-12");
+});
+
+test("the newest accepted salary month wins even when run history is reordered", () => {
+  const runs: AgentRun[] = [
+    {
+      run_id: "april-reopened", project_id: "p", status: "published", salary_month: "2026.04",
+      validation: { status: "passed" }, updated_at: "2026-07-01T00:00:00Z",
+    },
+    {
+      run_id: "may", project_id: "p", status: "completed", salary_month: "2026.05",
+      validation: { status: "structurally_valid" }, updated_at: "2026-06-01T00:00:00Z",
+    },
+  ];
+
+  assert.equal(defaultTargetSalaryMonth("2026.04", runs), "2026-06");
 });
 
 test("keeps unresolved items visible when a different item is resolved", () => {

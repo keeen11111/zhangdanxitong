@@ -327,7 +327,8 @@ def test_keyuan_workflow_runs_only_when_model_calls_the_tool(
 
     assert captured["batch"] is not None
     assert run["keyuan_workflow"]["status"] == "passed"
-    assert run["status"] == "awaiting_review"
+    assert run["status"] == "execution_incomplete"
+    assert run["execution_result"]["code"] == "VALIDATION_NOT_PERFORMED"
     assert output.is_file()
 
 
