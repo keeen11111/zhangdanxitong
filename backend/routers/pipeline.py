@@ -16,6 +16,7 @@ import time
 from copy import copy
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -24,6 +25,7 @@ import openpyxl
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile as FastAPIUploadFile
 from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -49,6 +51,8 @@ from core.unified_integration import (
     remove_manual_issues_sheet,
 )
 from core.sheet_mapper import apply_semantic_sheet_updates
+from core._new_hire_sync import _only_hire_notices
+from backend.personnel_integration import _export_personnel_updates
 from core.diff_engine import compute_diff, apply_confirmed_diff
 from core.validator import DataValidator
 
@@ -2249,9 +2253,7 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
         p.salary_month,
         template_file.original_name,
     )
-    base_entities, template_logs = _load_template_base_entities(template_file, template_path)
     stage_durations["base"] = round(time.perf_counter() - stage_started, 2)
-    logs.extend(template_logs)
     stages[0]["status"] = "completed"
     _save_integration_progress(p.id, status="processing", stages=stages, detail="已加载总表底板")
     logs.append(
@@ -2268,6 +2270,36 @@ def integrate_pipeline(project_id: str, user: User = Depends(get_current_user),
         UploadFile.file_type.in_([*_PAYROLL_SOURCE_FILE_TYPES]),
     )
     source_files = source_query.order_by(UploadFile.created_at.asc()).all()
+    notice_paths = [Path(UPLOAD_DIR) / file.stored_path for file in source_files]
+    if _only_hire_notices(notice_paths):
+        try:
+            result = _export_personnel_updates(
+                Path(template_path), notice_paths,
+                {str(path): file.original_name for path, file in zip(notice_paths, source_files)},
+                Path(EXPORT_DIR) / p.id, effective_salary_month,
+                _load_json(p.id, "matching_policy"),
+            )
+            result["source_signature"], _ = _current_source_signature(p.id, db)
+            result["path"] = os.path.join(p.id, result["filename"])
+            result["review_path"] = os.path.join(p.id, result["review_filename"])
+            result["review_base_path"] = template_path
+            result["review_format_version"] = _REVIEW_EXPORT_FORMAT_VERSION
+            if result["issues_filename"]:
+                result["issues_path"] = os.path.join(p.id, result["issues_filename"])
+            result["duration_seconds"] = round(time.perf_counter() - integration_started, 2)
+            _save_json(p.id, "export_meta", jsonable_encoder(result))
+            for stage in stages:
+                stage["status"] = "completed"
+            status = "completed_with_issues" if result["issues"] else "completed"
+            _save_integration_progress(p.id, status=status, stages=stages, detail="人员信息同步已结束")
+            return IntegrationResult(**{
+                **result, "status": status, "stages": stages, "overview": [],
+            })
+        except Exception:
+            _save_integration_progress(p.id, status="failed", stages=stages, detail="人员信息同步失败")
+            raise
+    base_entities, template_logs = _load_template_base_entities(template_file, template_path)
+    logs.extend(template_logs)
     for source_file in source_files:
         source_path = os.path.join(UPLOAD_DIR, source_file.stored_path)
         if not os.path.exists(source_path):

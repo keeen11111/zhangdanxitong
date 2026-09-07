@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -10,6 +11,8 @@ import re
 from typing import Any, Iterable
 
 from openpyxl import load_workbook
+
+from core._new_hire_sync import _apply_hire_notices
 
 
 _KEY_PRIORITY = ("工号", "身份证号", "单据号", "项目编号", "订单号")
@@ -346,13 +349,29 @@ def apply_semantic_sheet_updates(
     source_display_names = {
         _normalized_path(path): name for path, name in (source_names or {}).items()
     }
+    sources_stack = ExitStack()
     try:
+        sources = []
         for update_path_raw in update_paths:
             update_path = Path(update_path_raw)
-            display_path = Path(source_display_names.get(_normalized_path(update_path), update_path.name))
+            filename = source_display_names.get(_normalized_path(update_path), update_path.name)
             source_book = load_workbook(update_path, read_only=False, data_only=False)
+            sources_stack.callback(source_book.close)
+            sources.append((update_path, filename, source_book))
+        hires = _apply_hire_notices(
+            master, sources,
+            lambda source_sheet, field: _configured_field_action(matching_policy, source_sheet, field, salary_month),
+            salary_month,
+        )
+        issues.extend(hires["issues"])
+        updates.extend(hires["updates"])
+        matches_out.extend(hires["matches"])
+        for update_path, filename, source_book in sources:
+            display_path = Path(filename)
             try:
                 for source_sheet in source_book.worksheets:
+                    if (str(update_path.resolve()), source_sheet.title) in hires["consumed"]:
+                        continue
                     source_profile = _sheet_profile(source_sheet)
                     if source_profile is None:
                         issues.append(_issue(
@@ -370,6 +389,8 @@ def apply_semantic_sheet_updates(
                     display_path.name,
                     sheet_overrides,
                 ):
+                    if (str(update_path.resolve()), match.source.title) in hires["consumed"]:
+                        continue
                     if (
                         match.target is None
                         and match.reason == "insufficient_topic_evidence"
@@ -518,7 +539,7 @@ def apply_semantic_sheet_updates(
             finally:
                 source_book.close()
 
-        auto_update_count = 0
+        auto_update_count = len(updates)
         for (sheet_name, row, column), candidates in proposals.items():
             values = {_text(value) for value, _ in candidates}
             preferred_candidate = _current_month_attendance_or_bonus_candidate(candidates, salary_month)
@@ -550,8 +571,12 @@ def apply_semantic_sheet_updates(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         master.save(output_path)
     finally:
+        sources_stack.close()
         master.close()
     return {
         "output_path": str(output_path), "auto_update_count": auto_update_count,
         "issues": issues, "matches": matches_out, "updates": updates,
+        "personnel_coverage": hires["personnel_coverage"],
+        "structured_hire": hires["structured_hire"],
+        "row_insertions": getattr(master, '_personnel_row_insertions', []),
     }

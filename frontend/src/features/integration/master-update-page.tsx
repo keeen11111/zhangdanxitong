@@ -115,6 +115,10 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
   const changes = useMemo(() => files.filter((file) => file.file_type === "source" || file.file_type === "financial_source"), [files]);
   const step = !master ? 1 : !changesConfirmed ? 2 : 3;
   const estimatedIntegrationSeconds = Math.max(45, 25 + changes.length * 35);
+  const personnelCoverage = result?.validation?.personnel_coverage;
+  const completionMessage = personnelCoverage
+    ? `已自动处理 ${personnelCoverage.processed_person_count}/${personnelCoverage.input_person_count} 人，匹配率 ${Math.round((personnelCoverage.match_rate || 0) * 100)}%；已回填 ${personnelCoverage.matched_field_count}/${personnelCoverage.input_field_count} 项来源信息。`
+    : result?.issue_count ? `还有 ${result.issue_count} 项需要处理。` : "全部内容已更新完成。";
 
   const loadWorkspace = useCallback(async () => {
     const [projectResult, fileResult, exportResult] = await Promise.allSettled([
@@ -185,6 +189,38 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
     }
   }
 
+  async function uploadAndMerge(selected: File[]) {
+    const { accepted, rejected } = excelSelection(selected);
+    if (accepted.length === 1 && !rejected.length) return uploadMaster(accepted);
+    setFailures(rejected);
+    if (rejected.length || accepted.length < 2) return toast.error("请选择总表和变更文件");
+    setMasterUploading(true);
+    try {
+      let uploaded: FileMeta[];
+      try {
+        uploaded = await api.uploadFilesAuto(projectId, accepted);
+      } catch (error) {
+        const failure = { filename: "工作簿", message: error instanceof Error ? error.message : "" };
+        if (!isEncryptedWorkbookFailure(failure)) throw error;
+        const password = promptForWorkbookPassword();
+        if (password === undefined) return;
+        uploaded = await api.uploadFilesAuto(projectId, accepted, password);
+      }
+      const merged = mergeFileRecords(files, uploaded);
+      setFiles(merged);
+      setResult(null);
+      const masterCount = merged.filter((file) => file.file_type === "template").length;
+      const sourceCount = merged.filter((file) => file.file_type === "source").length;
+      if (masterCount !== 1 || sourceCount === 0) throw new Error("需要一份包含工资核算表页的总表和至少一份变更文件");
+      setChangesConfirmed(true);
+      await generateWorkbook(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "自动合并失败");
+    } finally {
+      setMasterUploading(false);
+    }
+  }
+
   async function uploadChanges(selected: File[]) {
     const { accepted, rejected } = excelSelection(selected);
     setFailures(rejected);
@@ -229,8 +265,8 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
     }
   }
 
-  async function generateWorkbook() {
-    if (!master || !changes.length) return;
+  async function generateWorkbook(prepared = false) {
+    if (!prepared && (!master || !changes.length)) return;
     setIntegrationProgress(null);
     setIntegrationElapsedSeconds(0);
     setIntegrating(true);
@@ -281,7 +317,7 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
 
       {result?.filename ? <section className="rounded-md border border-emerald-200 bg-emerald-50 p-4"><div className="flex items-start gap-3"><CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" /><div><h2 className="text-sm font-semibold text-emerald-950">最终总表已更新</h2><p className="mt-1 text-xs text-emerald-800">{result.issue_count ? `还有 ${result.issue_count} 项需要人工填写。` : "没有需要人工填写的事项。"}</p></div></div><div className="mt-3 flex flex-col gap-2 border-t border-emerald-200 pt-3 sm:flex-row"><Button type="button" size="sm" variant="outline" className="border-teal-300 bg-white text-teal-900 hover:bg-teal-50" disabled={downloading !== null} onClick={() => void downloadWorkbook("formal")}>{downloading === "formal" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载正式稿</Button>{result.review_filename ? <Button type="button" size="sm" variant="outline" className="border-amber-300 bg-white text-amber-950 hover:bg-amber-50" disabled={downloading !== null} onClick={() => void downloadWorkbook("review")}>{downloading === "review" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}下载修改稿（含变更批注）</Button> : null}</div></section> : null}
 
-      {step === 1 ? <WorkbookUploadPanel title="第 1 步：上传总表" description="选择这次需要更新的总表。" helper="选择总表" files={masters} uploading={masterUploading} tone="master" onSelect={(selected) => void uploadMaster(selected)} onRemove={(file) => void removeFile(file)} /> : null}
+      {step === 1 ? <WorkbookUploadPanel title="上传文件，自动合并" description="同时选择文件夹中的总表和新增人员表，系统自动识别、匹配并生成结果。也可以先上传一份总表。" helper="选择总表和变更文件" files={masters} multiple uploading={masterUploading} disabled={integrating} tone="master" onSelect={(selected) => void uploadAndMerge(selected)} onRemove={(file) => void removeFile(file)} /> : null}
 
       {step === 2 ? <><section className="flex items-center justify-between gap-3 rounded-md border border-slate-200 bg-slate-50 px-4 py-3"><p className="min-w-0 truncate text-sm text-slate-700">已上传总表：<span className="font-medium">{master?.original_name}</span></p><Button type="button" size="sm" variant="outline" onClick={() => master && void removeFile(master)}>更换</Button></section><WorkbookUploadPanel title="第 2 步：上传变更文件" description="可多次添加，也可一次选择多个文件。" helper="选择变更文件" files={changes} multiple uploading={changesUploading} tone="changes" onSelect={(selected) => void uploadChanges(selected)} onRemove={(file) => void removeFile(file)} /><section className="flex flex-col gap-3 rounded-md border border-slate-200 bg-white p-4 sm:flex-row sm:items-center sm:justify-between"><p className="text-sm text-slate-600">{changes.length ? `已添加 ${changes.length} 份变更文件，确认后再开始更新。` : "请先添加至少 1 份变更文件。"}</p><Button type="button" disabled={!changes.length || changesUploading} onClick={() => setChangesConfirmed(true)} className="bg-teal-700 hover:bg-teal-800">确认变更文件（{changes.length}）</Button></section></> : null}
 
@@ -289,7 +325,9 @@ export function MasterUpdatePage({ projectId }: { projectId: string }) {
 
       {failures.length ? <section className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3" role="alert"><div className="flex items-center gap-2"><AlertTriangle className="h-4 w-4 text-amber-700" /><h2 className="text-sm font-semibold text-amber-950">有文件未上传</h2></div><ul className="mt-2 space-y-1 text-xs text-amber-900">{failures.map((failure) => <li key={`${failure.filename}-${failure.message}`}>{failure.filename}：{failure.message}</li>)}</ul></section> : null}
 
-      <Dialog open={completionOpen} onOpenChange={(open) => { if (open) setCompletionOpen(true); else closeCompletionNotice(); }}><DialogContent><DialogHeader><DialogTitle>总表已更新</DialogTitle><DialogDescription>{result?.issue_count ? `还有 ${result.issue_count} 项需要人工填写。` : "全部内容已更新完成。"} 修改稿会保留与正式稿相同的数据，并标注本次更新的原值和新值。</DialogDescription></DialogHeader><DialogFooter><Button type="button" variant="outline" onClick={closeCompletionNotice}>关闭</Button></DialogFooter></DialogContent></Dialog>
+      {personnelCoverage ? <section className="rounded-md border border-teal-200 bg-teal-50 p-4 text-sm text-teal-950"><p>{completionMessage}</p><p className="mt-2 text-xs">{result?.validation.message}</p></section> : null}
+
+      <Dialog open={completionOpen} onOpenChange={(open) => { if (open) setCompletionOpen(true); else closeCompletionNotice(); }}><DialogContent><DialogHeader><DialogTitle>总表已更新</DialogTitle><DialogDescription>{completionMessage} 修改稿保留逐项变更批注。{personnelCoverage ? "本次更新人员信息与薪资标准。" : ""}</DialogDescription></DialogHeader><DialogFooter><Button type="button" variant="outline" onClick={closeCompletionNotice}>关闭</Button></DialogFooter></DialogContent></Dialog>
     </div>
   );
 }

@@ -170,9 +170,14 @@ def _release_state(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         "matched_sheet_count": matched_sheet_count,
         "auto_update_count": int(result.get("auto_update_count", 0)),
     }
+    if result.get("personnel_coverage", {}).get("input_person_count"):
+        checks["personnel_coverage"] = result["personnel_coverage"]
+        checks["can_release"] = checks["can_release"] and result["personnel_coverage"]["unprocessed_person_count"] == 0
     if issue_count:
         return "review_required", checks
     if not matched_sheet_count:
+        return "blocked", checks
+    if not checks["can_release"]:
         return "blocked", checks
     return "ready_for_release", checks
 
@@ -567,6 +572,9 @@ def create_financial_workbook_integration(
                 str(path): str(source.original_name) for path, source in zip(source_paths, sources)
             }
         result = apply_semantic_sheet_updates(master_path, source_paths, output_path, **integration_kwargs)
+        if result.get('structured_hire') and not result['issues']:
+            from backend.workbook_calculation import recalculate_personnel_workbook
+            result['calculation'] = recalculate_personnel_workbook(master_path, output_path, result.get('row_insertions', []))
 
         current_stages = _progress_stages(3)
         _write_progress(
@@ -576,6 +584,9 @@ def create_financial_workbook_integration(
             detail="总表数据已更新，正在生成正式稿和修订稿",
         )
         _create_review_workbook(output_path, review_path, result["updates"])
+        if result.get('calculation'):
+            from backend.workbook_calculation import preserve_review_formula_caches
+            preserve_review_formula_caches(output_path, review_path)
         status, release_checks = _release_state(result)
         meta = {
             "filename": filename,

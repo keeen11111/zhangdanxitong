@@ -1298,6 +1298,16 @@ export interface PipelineValidationItem {
 }
 
 export interface PipelineValidation {
+  scope?: string;
+  message?: string;
+  personnel_coverage?: {
+    input_person_count: number;
+    processed_person_count: number;
+    unprocessed_person_count: number;
+    input_field_count: number;
+    matched_field_count: number;
+    match_rate: number | null;
+  };
   metrics: AuditMetrics;
   blockers: PipelineValidationItem[];
   warnings: PipelineValidationItem[];
